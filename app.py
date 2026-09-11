@@ -950,7 +950,7 @@ def _name_key(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", LEGAL_SUFFIX_RE.sub("", (name or "").lower()))
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def find_domain_clearbit(company: str) -> str:
     """
     Company name -> domain, no key, no credits: Clearbit's public autocomplete.
@@ -1050,7 +1050,7 @@ def find_directories_tavily(show_name: str, api_key: str) -> list[dict]:
     return out[:8]
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def find_domain_tavily(company: str, api_key: str) -> str:
     """Company name -> website via web search, used only when Clearbit has no match. 1 Tavily credit."""
     want = _name_key(company)
@@ -1068,7 +1068,7 @@ def find_domain_tavily(company: str, api_key: str) -> str:
     return ""
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def find_domain_apollo(company: str, api_key: str) -> str:
     """
     PRODUCTION PATH (paid plans) -- Apollo Organization Search, name -> domain.
@@ -1106,7 +1106,7 @@ def find_domain_apollo(company: str, api_key: str) -> str:
         return ""
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def enrich_company_apollo(domain: str, api_key: str) -> dict | None:
     """
     PRODUCTION PATH -- real Apollo.io organisation enrichment.
@@ -1164,7 +1164,7 @@ def enrich_company_apollo(domain: str, api_key: str) -> dict | None:
         return None
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def find_contact_apollo(domain: str, titles: tuple[str, ...], api_key: str) -> dict | None:
     """
     PRODUCTION PATH -- Apollo People Search, mapping a domain to the person
@@ -1207,12 +1207,60 @@ def find_contact_apollo(domain: str, titles: tuple[str, ...], api_key: str) -> d
             "Contact Title": person.get("title") or "",
             "Contact Email": email,
             "Contact LinkedIn": person.get("linkedin_url") or "",
+            # Free ride: the search payload carries the employer record too.
+            "_org": _org_fields(person.get("organization") or {}),
         }
     except Exception:
         return None
 
 
+def _org_fields(org: dict) -> dict:
+    """Map whatever organisation fields Apollo returned onto our columns (None where absent)."""
+    revenue = org.get("annual_revenue")
+    headcount = org.get("estimated_num_employees")
+    try:
+        revenue = round(float(revenue) / 1e6, 1) if revenue else None
+    except (TypeError, ValueError):
+        revenue = None
+    try:
+        headcount = int(headcount) if headcount else None
+    except (TypeError, ValueError):
+        headcount = None
+    return {
+        "Revenue ($M)": revenue,
+        "Headcount": headcount,
+        "Industry": (str(org.get("industry") or "").title() or None),
+    }
+
+
 CONTACT_COLUMNS = ("Contact", "Contact Title", "Contact Email", "Contact LinkedIn")
+
+# Apollo credit ledger for this server process: domains that have been sent to
+# the 1-credit organisation-enrichment endpoint. Cached results are free, so
+# this is the number that counts against the monthly allowance.
+APOLLO_CHARGED: set[str] = set()
+APOLLO_FREE_MONTHLY_CREDITS = 75
+
+
+def _worth_a_credit(sqft: int, free_headcount: int | None, params: dict | None) -> int:
+    """
+    Priority for spending a 1-credit organisation enrichment (lower = first).
+    Booth size is the one thing we know for certain before spending anything,
+    so in-band booths go first; a small booth is only worth a credit when the
+    free people-search payload already says the company is big (a big-fish
+    candidate). Islands and unplaced exhibitors never get a credit.
+    """
+    if not params:
+        return 0
+    b_lo, b_hi = params.get("booth_range", DEFAULTS["booth_range"])
+    h_hi = params.get("headcount_range", DEFAULTS["headcount_range"])[1]
+    if not sqft or sqft > b_hi:
+        return 99
+    if b_lo <= sqft <= b_hi:
+        return 0
+    if free_headcount and free_headcount > h_hi:
+        return 1
+    return 2
 
 
 def enrich_companies(rows: list[dict], api_key: str | None = None, progress=None) -> pd.DataFrame:
@@ -1237,27 +1285,34 @@ def enrich_companies(rows: list[dict], api_key: str | None = None, progress=None
     return pd.DataFrame(enriched)
 
 
-def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progress=None, tavily_key: str | None = None) -> dict:
+def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progress=None,
+                 tavily_key: str | None = None, budget: int | None = None, params: dict | None = None) -> dict:
     """
-    PRODUCTION PATH -- the live Apollo pass, in place, for the named companies:
+    PRODUCTION PATH -- the live Apollo pass, in place, for the named companies,
+    ordered so a Free plan (75 credits a month) goes as far as possible:
 
-        1. no website from the directory?  -> find_domain_clearbit() (free),
-                                              then find_domain_tavily() (if a Tavily key is set),
-                                              then find_domain_apollo() (paid Apollo plans)
-        2. domain known                    -> enrich_company_apollo() (1 credit)
-           replaces the modelled revenue / headcount / industry
-        3. re-pick the target titles for the real headcount
-        4. find_contact_apollo() for those titles -> name, title, LinkedIn
-           (email stays blank until the person is enriched: 1 more credit)
+        1. domain (0 credits)     -> from the directory, else find_domain_clearbit(),
+                                     then find_domain_tavily() (if a Tavily key is set),
+                                     then find_domain_apollo() (paid Apollo plans only)
+        2. people search (0 credits per Apollo's API pricing page)
+                                  -> decision-maker name, title, LinkedIn, plus the
+                                     employer record riding along in the payload
+                                     (headcount / industry / sometimes revenue)
+        3. organisation enrichment (1 credit) -> only if revenue is still unknown,
+                                     only while the per-scrape budget lasts, and in
+                                     priority order: in-band booths first, then small
+                                     booths that the free payload says are big
+                                     (big-fish candidates); islands never.
 
-    Returns counts for the status log. Everything is cached for 24h, so
-    re-running the scrape or clicking "run more" does not re-spend credits.
-    Budget: Apollo's Free plan is 75 credits a month, so the default cap of
-    25 leads per scrape is deliberate.
+    Every call is cached for 24h (on disk), so re-running a scrape or clicking
+    "run more" does not re-spend credits. Emails are never revealed here: that
+    is 1 credit per person and the people/match endpoint is paid-plan only.
     """
-    stats = {"domains": 0, "orgs": 0, "contacts": 0, "tried": 0}
+    stats = {"domains": 0, "orgs": 0, "contacts": 0, "tried": 0, "credits": 0, "skipped_budget": 0}
     wanted = set(companies)
     idx = [i for i in leads.index if leads.at[i, "Company"] in wanted]
+    pending: list[tuple[int, int, str]] = []  # (priority, row index, domain) for the credit step
+
     for n, i in enumerate(idx):
         company = str(leads.at[i, "Company"])
         website = str(leads.at[i, "Website"] or "")
@@ -1272,7 +1327,44 @@ def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progre
         if not domain:
             continue
         stats["tried"] += 1
+
+        # Free step: people search, with the employer record it carries.
+        titles = recommend_titles(int(leads.at[i, "Headcount"]))
+        contact = dict(find_contact_apollo(domain, tuple(titles), api_key) or {})
+        free_org = contact.pop("_org", {}) or {}
+        free_headcount = free_org.get("Headcount")
+        if any(v not in (None, "") for v in free_org.values()):
+            for k, v in free_org.items():
+                if v not in (None, ""):
+                    leads.at[i, k] = v
+            leads.at[i, "Enrichment"] = "Apollo (search)"
+        if contact:
+            for k, v in contact.items():
+                leads.at[i, k] = v
+            stats["contacts"] += 1
+
+        if free_org.get("Revenue ($M)") in (None, ""):
+            pending.append((_worth_a_credit(int(leads.at[i, "Sq Ft"] or 0), free_headcount, params), i, domain))
+        else:
+            leads.at[i, "Enrichment"] = "Apollo"
+            stats["orgs"] += 1
+        if progress is not None:
+            progress(n + 1, len(idx), company)
+
+    # Credit step, best candidates first, capped by the budget.
+    pending.sort(key=lambda t: t[0])
+    spent = 0
+    for priority, i, domain in pending:
+        if priority >= 99:
+            continue
+        charged_before = domain in APOLLO_CHARGED
+        if budget is not None and not charged_before and spent >= budget:
+            stats["skipped_budget"] += 1
+            continue
         org = enrich_company_apollo(domain, api_key)
+        if not charged_before:
+            APOLLO_CHARGED.add(domain)
+            spent += 1
         if org:
             for k in ("Revenue ($M)", "Headcount", "Industry"):
                 if org.get(k) not in (None, ""):
@@ -1281,13 +1373,7 @@ def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progre
             stats["orgs"] += 1
         titles = recommend_titles(int(leads.at[i, "Headcount"]))
         leads.at[i, "Target Titles"] = " > ".join(titles)
-        contact = find_contact_apollo(domain, tuple(titles), api_key)
-        if contact:
-            for k, v in contact.items():
-                leads.at[i, k] = v
-            stats["contacts"] += 1
-        if progress is not None:
-            progress(n + 1, len(idx), company)
+    stats["credits"] = spent
     return stats
 
 
@@ -1794,14 +1880,17 @@ def render_sidebar() -> dict:
         with st.expander("Enrichment & search keys (optional)", expanded=False):
             st.caption(
                 "Without a key, revenue and headcount are modelled. With an Apollo.io master API key the top "
-                "leads (the number above) go through Apollo after each scrape: organisation enrichment and "
-                "people search for the target titles, 1-2 credits per company (domains come from a free "
-                "lookup first). Free plan: 75 credits a month, so keep the cap at 25."
+                "leads (the number above) go through Apollo after each scrape. Free steps first: domain lookup "
+                "and people search (name, title, LinkedIn, employer record). The 1-credit organisation "
+                "enrichment runs only where revenue is still unknown, in-band booths first, up to the budget below."
             )
             apollo_key = st.text_input("Apollo API key", value=secret_key, type="password",
                                        help="Apollo -> Settings -> Integrations -> API -> Create new key "
                                             "(tick 'master API key'). On Streamlit Cloud, store it under "
                                             "App settings -> Secrets as APOLLO_API_KEY.")
+            apollo_budget = st.number_input("Apollo credits per scrape", min_value=0, max_value=500, value=25, step=5,
+                                            help=f"Free plan: {APOLLO_FREE_MONTHLY_CREDITS} credits a month, one per "
+                                                 "organisation enrichment. 25 a scrape = three shows a month.")
             tavily_key = st.text_input("Tavily API key", value=secret_tavily, type="password",
                                        help="Web search: finds any convention's exhibitor directory by name and "
                                             "backs up the website lookup. Store it as TAVILY_API_KEY.")
@@ -1809,6 +1898,9 @@ def render_sidebar() -> dict:
         loaded = [n for n, v in (("Apollo", secret_key), ("Tavily", secret_tavily)) if v]
         if loaded:
             st.caption(" and ".join(loaded) + " key" + ("s" if len(loaded) > 1 else "") + " loaded from secrets.")
+        if APOLLO_CHARGED:
+            st.caption(f"Apollo credits spent since the app last started: {len(APOLLO_CHARGED)} "
+                       f"(Free plan: {APOLLO_FREE_MONTHLY_CREDITS}/month).")
 
     return {
         "booth_range": st.session_state["booth_range"],
@@ -1821,6 +1913,7 @@ def render_sidebar() -> dict:
         "website_cap": int(website_cap),
         "sender": sender,
         "apollo_key": apollo_key.strip() or None,
+        "apollo_budget": int(apollo_budget),
         "tavily_key": tavily_key.strip() or None,
     }
 
@@ -1931,10 +2024,12 @@ def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, params: dic
             abar = st.progress(0.0, text="Apollo")
             stats = apply_apollo(leads, apollo_key, list(top["Company"]),
                                  progress=lambda d, t, c: abar.progress(d / t, text=f"{d}/{t}  {c}"),
-                                 tavily_key=params.get("tavily_key"))
+                                 tavily_key=params.get("tavily_key"), budget=params.get("apollo_budget"), params=params)
             abar.progress(1.0, text="Apollo pass complete")
             st.write(f"Apollo matched {stats['orgs']} of {stats['tried']} companies "
-                     f"({stats['domains']} domains found by name, {stats['contacts']} decision-makers found).")
+                     f"({stats['domains']} domains found by name, {stats['contacts']} decision-makers found). "
+                     f"Credits spent: {stats['credits']}"
+                     + (f"; {stats['skipped_budget']} enrichments held back by the per-scrape budget." if stats["skipped_budget"] else "."))
             if stats["tried"] and not stats["orgs"] and not stats["contacts"]:
                 st.warning("Apollo returned nothing for those domains. Check that the key is a master API key, "
                            "that the plan still has credits, and that the key was saved as APOLLO_API_KEY.")
@@ -1969,7 +2064,8 @@ def fetch_more_websites(cap: int, params: dict) -> None:
             leads["Website"] = [site_map.get(c, w) or w for c, w in zip(leads["Company"], leads["Website"])]
     if params.get("apollo_key"):
         with st.spinner(f"Apollo: enriching {len(top)} leads..."):
-            apply_apollo(leads, params["apollo_key"], list(top["Company"]), tavily_key=params.get("tavily_key"))
+            apply_apollo(leads, params["apollo_key"], list(top["Company"]), tavily_key=params.get("tavily_key"),
+                         budget=params.get("apollo_budget"), params=params)
     st.session_state["leads"] = leads
 
 
