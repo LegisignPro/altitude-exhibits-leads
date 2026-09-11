@@ -937,14 +937,59 @@ def _apollo_headers(api_key: str) -> dict:
             "Content-Type": "application/json"}
 
 
+LEGAL_SUFFIX_RE = re.compile(r"\b(inc|incorporated|llc|ltd|limited|corp|corporation|co|company|gmbh|ag|sa|srl|plc|lp|llp|group|holdings)\b\.?", re.I)
+
+
+def _name_key(name: str) -> str:
+    """'3Play Media, Inc.' -> '3playmedia' so directory names and registry names compare cleanly."""
+    return re.sub(r"[^a-z0-9]", "", LEGAL_SUFFIX_RE.sub("", (name or "").lower()))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def find_domain_clearbit(company: str) -> str:
+    """
+    Company name -> domain, no key, no credits: Clearbit's public autocomplete.
+
+    Trade-show directories rarely publish a website (NAB's do not) and every
+    Apollo call is keyed on the domain, so this runs first for leads without
+    one. The endpoint returns up to five fuzzy suggestions; only a suggestion
+    whose name matches the exhibitor's (after dropping punctuation and legal
+    suffixes) is accepted, so '16x9, Inc.' picks 16x9inc.com and not the
+    unrelated first hit.
+    """
+    if not company:
+        return ""
+    try:
+        resp = requests.get("https://autocomplete.clearbit.com/v1/companies/suggest",
+                            params={"query": company}, headers=REQUEST_HEADERS, timeout=8)
+        if resp.status_code != 200:
+            return ""
+        want = _name_key(company)
+        if not want:
+            return ""
+        hits = [(_name_key(str(h.get("name") or "")), str(h.get("domain") or "").strip().lower())
+                for h in (resp.json() or []) if h.get("domain")]
+        for got, domain in hits:            # 1. exact name match
+            if got == want:
+                return domain
+        for got, domain in hits:            # 2. one name extends the other ('3Play Media' vs '3Play Media Inc')
+            shorter = min(len(got), len(want))
+            if shorter >= max(4, 0.6 * max(len(got), len(want))) and (got.startswith(want) or want.startswith(got)):
+                return domain
+        return ""
+    except Exception:
+        return ""
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def find_domain_apollo(company: str, api_key: str) -> str:
     """
-    PRODUCTION PATH -- Apollo Organization Search, company name -> domain.
+    PRODUCTION PATH (paid plans) -- Apollo Organization Search, name -> domain.
 
-    Trade-show directories rarely publish a website (NAB's do not), and every
-    other Apollo call is keyed on the domain, so this runs first for leads
-    without one.
+    Second choice after find_domain_clearbit(): Apollo's Free plan does not
+    expose this endpoint at all (the key-creation screen lists
+    mixed_companies/search among the paid-only APIs), so on Free it simply
+    returns nothing and costs nothing.
 
     Endpoint: POST https://api.apollo.io/api/v1/mixed_companies/search
     Query:    q_organization_name=<company>&page=1&per_page=1
@@ -1109,7 +1154,8 @@ def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progre
     """
     PRODUCTION PATH -- the live Apollo pass, in place, for the named companies:
 
-        1. no website from the directory?  -> find_domain_apollo()   (1 credit)
+        1. no website from the directory?  -> find_domain_clearbit() (free),
+                                              then find_domain_apollo() (paid plans)
         2. domain known                    -> enrich_company_apollo() (1 credit)
            replaces the modelled revenue / headcount / industry
         3. re-pick the target titles for the real headcount
@@ -1117,7 +1163,9 @@ def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progre
            (email stays blank until the person is enriched: 1 more credit)
 
     Returns counts for the status log. Everything is cached for 24h, so
-    re-running the scrape or clicking "look up more" does not re-spend credits.
+    re-running the scrape or clicking "run more" does not re-spend credits.
+    Budget: Apollo's Free plan is 75 credits a month, so the default cap of
+    25 leads per scrape is deliberate.
     """
     stats = {"domains": 0, "orgs": 0, "contacts": 0, "tried": 0}
     wanted = set(companies)
@@ -1127,7 +1175,7 @@ def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progre
         website = str(leads.at[i, "Website"] or "")
         domain = urlparse(website).netloc.replace("www.", "") if website else ""
         if not domain:
-            domain = find_domain_apollo(company, api_key)
+            domain = find_domain_clearbit(company) or find_domain_apollo(company, api_key)
             if domain:
                 leads.at[i, "Website"] = f"https://{domain}"
                 stats["domains"] += 1
@@ -1577,8 +1625,9 @@ def render_sidebar() -> dict:
         with st.expander("Enrichment settings (optional)", expanded=False):
             st.caption(
                 "Without a key, revenue and headcount are modelled. With an Apollo.io master API key the top "
-                "leads (the number above) go through Apollo after each scrape: domain lookup, organisation "
-                "enrichment and people search for the target titles -- about 3 credits per company."
+                "leads (the number above) go through Apollo after each scrape: organisation enrichment and "
+                "people search for the target titles, 1-2 credits per company (domains come from a free "
+                "lookup first). Free plan: 75 credits a month, so keep the cap at 25."
             )
             apollo_key = st.text_input("Apollo API key", value=secret_key, type="password",
                                        help="Apollo -> Settings -> Integrations -> API -> Create new key "
@@ -1709,8 +1758,11 @@ def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, params: dic
             abar.progress(1.0, text="Apollo pass complete")
             st.write(f"Apollo matched {stats['orgs']} of {stats['tried']} companies "
                      f"({stats['domains']} domains found by name, {stats['contacts']} decision-makers found).")
-            if not stats["tried"] and not stats["orgs"]:
-                st.warning("Apollo returned nothing. Check that the key is a master API key and the plan has API access.")
+            if stats["tried"] and not stats["orgs"] and not stats["contacts"]:
+                st.warning("Apollo returned nothing for those domains. Check that the key is a master API key, "
+                           "that the plan still has credits, and that the key was saved as APOLLO_API_KEY.")
+            elif not stats["tried"]:
+                st.warning("No domains could be found for the top leads, so Apollo had nothing to look up.")
 
         meta["scraped_at"] = datetime.now().strftime("%b %d, %Y %I:%M %p")
         st.session_state["leads"] = leads
@@ -1943,7 +1995,7 @@ def main() -> None:
 
     if params.get("apollo_key"):
         missing = int(((scored["Enrichment"] != "Apollo") & scored["Goldilocks"]).sum())
-        verb, note = "Run Apollo on next", "qualified leads have not been through Apollo yet (about 3 credits each)."
+        verb, note = "Run Apollo on next", "qualified leads have not been through Apollo yet (1-2 credits each)."
     else:
         missing = int(((scored["Website"] == "") & (scored["Detail URL"] != "") & scored["Goldilocks"]).sum()) if "Detail URL" in scored.columns else 0
         verb, note = "Look up websites for next", "qualified leads still need a website (one detail-page request each)."
