@@ -1,0 +1,10 @@
+# Altitude Exhibits dashboard theme. Dark by default (the app is also fine in light mode).
+[theme]
+base = "dark"
+primaryColor = "#1f6fb5"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
