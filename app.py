@@ -1113,6 +1113,11 @@ def slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
 
 
+def md(text: str) -> str:
+    """Escape dollar signs so Streamlit's markdown doesn't treat '$15M-$100M' as LaTeX."""
+    return text.replace("$", "\\$")
+
+
 def inject_css() -> None:
     """Small amount of CSS. Colours are translucent so they work in light and dark themes."""
     st.markdown(
@@ -1443,7 +1448,7 @@ def main() -> None:
                   delta=f"{len(qualified) / len(scored):.0%} of list" if len(scored) else None, delta_color="off")
     with k3, st.container(border=True):
         st.metric("Estimated pipeline value", fmt_money(pipeline_value),
-                  help=f"Sum of booth sq ft x ${params['price_per_sqft']}/sq ft across qualified leads.")
+                  help=md(f"Sum of booth sq ft x ${params['price_per_sqft']}/sq ft across qualified leads."))
     with k4, st.container(border=True):
         if timeline["days_out"] is not None:
             st.metric("Outreach window", timeline["label"], delta=f"{timeline['days_out']} days to {convention}", delta_color="off",
@@ -1549,14 +1554,14 @@ def main() -> None:
             b_lo, b_hi = params["booth_range"]
             r_lo, r_hi = params["revenue_range"]
             h_lo, h_hi = params["headcount_range"]
-            st.markdown(
+            st.markdown(md(
                 f"- Booth: {range_note(lead['Sq Ft'], b_lo, b_hi, ' sq ft')} ({lead['Booth Size']})\n"
                 f"- Revenue: {range_note(lead['Revenue ($M)'], r_lo, r_hi, 'M', '${:,.1f}')}\n"
                 f"- Headcount: {range_note(lead['Headcount'], h_lo, h_hi, ' employees')}\n"
                 f"- Industry: {lead['Industry']}\n"
                 f"- Est. deal: {fmt_money(lead['Est. Deal ($)'])} ({int(lead['Sq Ft'])} sq ft x ${params['price_per_sqft']}/sq ft)\n"
                 f"- Data: booth size {lead['Size Source']}, enrichment {lead['Enrichment']}"
-            )
+            ))
             st.markdown("**Who to reach**")
             if lead.get("Contact"):
                 st.markdown(f"- {lead['Contact']}, {lead['Contact Title']}" + (f"\n- {lead['Contact Email']}" if lead.get("Contact Email") else ""))
