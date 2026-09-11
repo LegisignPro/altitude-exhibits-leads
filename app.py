@@ -832,13 +832,23 @@ def fetch_websites(detail_urls: list[str]) -> list[str]:
         return list(pool.map(fetch_mys_website, detail_urls))
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def scrape_directory(url: str) -> tuple[list[dict], dict]:
     """
     Fetch + parse a directory URL. Returns (rows, meta). Raises ScrapeError
-    with a plain-English reason when the site cannot be read. Cached for an
-    hour so tweaking the sidebar never re-hits the show's servers.
+    with a plain-English reason when the site cannot be read. Results are
+    cached for an hour so tweaking the sidebar never re-hits the show's
+    servers -- except a MapYourShow pull that came back without any booth
+    geometry (a transient floor-plan hiccup), which is dropped from the cache
+    so the next click retries live instead of showing the miss for an hour.
     """
+    rows, meta = _scrape_directory_cached(url)
+    if meta.get("platform") == "MapYourShow" and not meta.get("sized"):
+        _scrape_directory_cached.clear()
+    return rows, meta
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _scrape_directory_cached(url: str) -> tuple[list[dict], dict]:
     if detect_platform(url) == "MapYourShow":
         return scrape_mapyourshow(url)
     html = fetch_html(url)
