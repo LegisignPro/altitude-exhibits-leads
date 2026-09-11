@@ -68,6 +68,10 @@ DEFAULTS = {
     "headcount_range": (50, 500),
     "price_per_sqft": 150,       # $ per sq ft of exhibit -- used for pipeline value
     "only_goldilocks": False,
+    # Second qualifying rule: a big company in a small booth. They are at the
+    # show because they have to be, and the flagship build comes later.
+    "big_fish": True,
+    "big_fish_min_revenue": 100,  # $M -- anything above the Goldilocks ceiling
 }
 PRESETS = {
     "Mid-market (200-600 sq ft)": (200, 600),
@@ -78,6 +82,7 @@ PRESETS = {
 # actually observe on the show floor, so it carries the most weight.
 SCORE_WEIGHTS = {"booth": 40, "revenue": 30, "headcount": 30}
 NEAR_MISS_THRESHOLD = 65  # misses one criterion but still worth a call
+BIG_FISH_FLOOR_SCORE = 75  # big-fish leads rank just under perfect Goldilocks matches
 
 REQUEST_TIMEOUT = 12  # seconds
 MIN_ROWS_FOR_VALID_SCRAPE = 3
@@ -981,6 +986,88 @@ def find_domain_clearbit(company: str) -> str:
         return ""
 
 
+# -----------------------------------------------------------------------------
+# Tavily web search: makes the app work for any convention in the country.
+#   - find_directories_tavily(): show name -> candidate exhibitor-directory URLs
+#   - find_domain_tavily():      company name -> website, when Clearbit misses
+# Key: https://app.tavily.com -> API keys; free tier is 1,000 credits a month.
+# Store it as TAVILY_API_KEY next to the Apollo key.
+# -----------------------------------------------------------------------------
+
+TAVILY_URL = "https://api.tavily.com/search"
+NOT_A_COMPANY_SITE = (
+    "linkedin.", "facebook.", "instagram.", "x.com", "twitter.", "youtube.", "wikipedia.", "crunchbase.",
+    "zoominfo.", "bloomberg.", "glassdoor.", "indeed.", "yelp.", "bbb.org", "dnb.com", "rocketreach.",
+    "manta.", "opencorporates.", "google.", "amazon.", "apollo.io", "mapyourshow.", "a2zinc.", "expocad.",
+    "tiktok.", "pinterest.", "reddit.", "trustpilot.", "owler.", "craft.co", "pitchbook.", "cbinsights.",
+)
+
+
+def _tavily_search(query: str, api_key: str, max_results: int = 6, include_domains: list[str] | None = None) -> list[dict]:
+    """POST https://api.tavily.com/search with Authorization: Bearer <key>. Returns [] on any failure."""
+    if not query or not api_key:
+        return []
+    body = {"query": query, "max_results": max_results, "search_depth": "basic", "topic": "general"}
+    if include_domains:
+        body["include_domains"] = include_domains
+    try:
+        resp = requests.post(TAVILY_URL, json=body, timeout=15,
+                             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        if resp.status_code != 200:
+            return []
+        return [r for r in (resp.json().get("results") or []) if r.get("url")]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def find_directories_tavily(show_name: str, api_key: str) -> list[dict]:
+    """
+    Any convention, any city: 'IMTS 2026' -> the exhibitor-directory URLs the
+    web knows about, MapYourShow first (exact booth sizes), then A2Z/ExpoCAD,
+    then anything whose address or title says 'exhibitor'.
+    """
+    seen, out = set(), []
+    for query in (f"{show_name} exhibitor list", f"{show_name} exhibitor directory floor plan booth"):
+        for hit in _tavily_search(query, api_key, max_results=8):
+            url = hit["url"].split("#")[0]
+            host = urlparse(url).netloc.lower()
+            title = _clean(str(hit.get("title") or ""))
+            platform = detect_platform(url)
+            looks_like_directory = platform != "Generic HTML" or re.search(r"exhibitor", url + " " + title, re.I)
+            if not looks_like_directory or url in seen:
+                continue
+            seen.add(url)
+            if platform == "MapYourShow" and "exhibitor-gallery" not in url:
+                base, root = mys_base(url)
+                url = f"{base}/{root}/explore/exhibitor-gallery.cfm?featured=false"  # the list, not the floor plan
+                if url in seen:
+                    continue
+                seen.add(url)
+            out.append({"title": title or host, "url": url, "platform": platform, "host": host})
+    rank = {"MapYourShow": 0, "A2Z Events": 1, "ExpoCAD": 2}
+    out.sort(key=lambda c: rank.get(c["platform"], 3))
+    return out[:8]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def find_domain_tavily(company: str, api_key: str) -> str:
+    """Company name -> website via web search, used only when Clearbit has no match. 1 Tavily credit."""
+    want = _name_key(company)
+    if not want or not api_key:
+        return ""
+    probe = want[:6]
+    for hit in _tavily_search(f'"{company}" official website', api_key, max_results=6):
+        host = urlparse(hit["url"]).netloc.lower().replace("www.", "")
+        if not host or any(bad in host for bad in NOT_A_COMPANY_SITE):
+            continue
+        title_key = _name_key(str(hit.get("title") or ""))
+        host_key = re.sub(r"[^a-z0-9]", "", host.split(".")[0])
+        if want in title_key or probe in host_key or host_key in want:
+            return host
+    return ""
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def find_domain_apollo(company: str, api_key: str) -> str:
     """
@@ -1150,12 +1237,13 @@ def enrich_companies(rows: list[dict], api_key: str | None = None, progress=None
     return pd.DataFrame(enriched)
 
 
-def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progress=None) -> dict:
+def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progress=None, tavily_key: str | None = None) -> dict:
     """
     PRODUCTION PATH -- the live Apollo pass, in place, for the named companies:
 
         1. no website from the directory?  -> find_domain_clearbit() (free),
-                                              then find_domain_apollo() (paid plans)
+                                              then find_domain_tavily() (if a Tavily key is set),
+                                              then find_domain_apollo() (paid Apollo plans)
         2. domain known                    -> enrich_company_apollo() (1 credit)
            replaces the modelled revenue / headcount / industry
         3. re-pick the target titles for the real headcount
@@ -1175,7 +1263,9 @@ def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progre
         website = str(leads.at[i, "Website"] or "")
         domain = urlparse(website).netloc.replace("www.", "") if website else ""
         if not domain:
-            domain = find_domain_clearbit(company) or find_domain_apollo(company, api_key)
+            domain = (find_domain_clearbit(company)
+                      or (find_domain_tavily(company, tavily_key) if tavily_key else "")
+                      or find_domain_apollo(company, api_key))
             if domain:
                 leads.at[i, "Website"] = f"https://{domain}"
                 stats["domains"] += 1
@@ -1239,9 +1329,25 @@ def score_leads(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     out["Headcount OK"] = out["Headcount"].between(h_lo, h_hi)
     out["Goldilocks"] = out["Booth OK"] & out["Revenue OK"] & out["Headcount OK"]
 
+    # Big fish: a company above the revenue ceiling in a booth no bigger than
+    # the Goldilocks ceiling. They are on the floor because they have to be;
+    # the flagship build comes later, and this is the shortlist conversation.
+    big_min = float(params.get("big_fish_min_revenue") or r_hi)
+    out["Big Fish"] = (
+        bool(params.get("big_fish", True))
+        & ~out["Goldilocks"]
+        & (out["Revenue ($M)"] >= big_min)
+        & (out["Sq Ft"] > 0)
+        & (out["Sq Ft"] <= b_hi)
+    )
+    out.loc[out["Big Fish"], "Score"] = out.loc[out["Big Fish"], "Score"].clip(lower=BIG_FISH_FLOOR_SCORE)
+    out["Qualified"] = out["Goldilocks"] | out["Big Fish"]
+
     def tier(row):
         if row["Goldilocks"]:
             return "Goldilocks"
+        if row["Big Fish"]:
+            return "Big fish"
         if not row["Sq Ft"]:
             return "No booth data"
         if row["Score"] >= NEAR_MISS_THRESHOLD:
@@ -1249,8 +1355,11 @@ def score_leads(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         return "Out of range"
 
     out["Tier"] = out.apply(tier, axis=1)
-    out["Est. Deal ($)"] = (out["Sq Ft"] * params["price_per_sqft"]).astype(int)
-    return out.sort_values(["Goldilocks", "Score"], ascending=[False, False]).reset_index(drop=True)
+    # Deal value: booth sq ft x $/sq ft. A big fish is valued at the mid-market
+    # floor because the build we are pitching is the one after this booth.
+    deal_sqft = out["Sq Ft"].where(~out["Big Fish"], out["Sq Ft"].clip(lower=b_lo))
+    out["Est. Deal ($)"] = (deal_sqft * params["price_per_sqft"]).astype(int)
+    return out.sort_values(["Qualified", "Score"], ascending=[False, False]).reset_index(drop=True)
 
 
 # =============================================================================
@@ -1354,11 +1463,15 @@ def generate_sequence(lead: pd.Series, show: str, show_start: date | None, venue
     contact_title = str(lead.get("Contact Title") or "") or recommend_titles(int(lead["Headcount"]))[0]
     first_name = contact.split(" ")[0] if contact else None
     greeting = f"Hi {first_name}," if first_name else f"Hi {company} team,"
+    big_fish = str(lead.get("Tier") or "") == "Big fish"
 
     timeline = outreach_timeline(show_start)
     hook = _timeline_line(show, show_start, timeline)
     angle = PERSONA_ANGLES.get(contact_title, PERSONA_ANGLES["Event Marketing Manager"]).format(industry=industry.lower(), show=show)
     venue_txt = venue or "the convention center"
+    # The home-turf pitch only makes sense when the show is in Las Vegas; for
+    # every other city the angle is a build that travels and re-deploys.
+    local = "vegas" in (venue or "").lower() or "vegas" in show.lower()
 
     name = sender.get("name") or "[Your name]"
     title = sender.get("title") or "Account Executive"
@@ -1368,57 +1481,107 @@ def generate_sequence(lead: pd.Series, show: str, show_start: date | None, venue
     first_touch = timeline["first_touch"]
     send_dates = [first_touch + timedelta(days=d) for d in SEQUENCE_OFFSETS_DAYS]
 
-    touch1 = (
-        f"{greeting}\n\n"
-        f"{hook} -- and I noticed {company} has a {dims} ({sqft:,} sq ft) space at {show}, Booth {booth}.\n\n"
-        f"That footprint is the sweet spot where a custom exhibit starts paying for itself in foot traffic, "
-        f"and it's the size we build most for {industry.lower()} exhibitors. {angle}\n\n"
-        f"Two things we'd like to put on the table up front:\n\n"
-        f"1. A complimentary 3D LED rendering of your {dims} at {show}: LED wall, lighting and demo stations "
-        f"designed around your product line, so you can see how it lands on the floor before you commit to "
-        f"anything. Yours to keep either way.\n"
-        f"2. A local build. {COMPANY_NAME} designs, fabricates, installs and dismantles in Las Vegas, which cuts "
-        f"cross-country freight, drayage friction and the last-minute on-site emergencies that come with an "
-        f"out-of-town exhibit house.\n\n"
-        f"You can see our custom fabrication and turnkey rental work at {COMPANY_SITE}.\n\n"
-        f"Would a 15-minute call next week make sense to talk through your {show} plans?\n\n"
-        f"{signature}"
-    )
+    if local:
+        build_point = (
+            f"2. A local build. {COMPANY_NAME} designs, fabricates, installs and dismantles in Las Vegas, which cuts "
+            f"cross-country freight, drayage friction and the last-minute on-site emergencies that come with an "
+            f"out-of-town exhibit house."
+        )
+    else:
+        build_point = (
+            f"2. A build that travels. {COMPANY_NAME} designs and fabricates in Las Vegas and ships show-ready, "
+            f"engineered so the same exhibit re-deploys across your calendar instead of being rebuilt for every city."
+        )
+
+    if big_fish:
+        render_dims = "20x20"
+        touch1 = (
+            f"{greeting}\n\n"
+            f"{hook} -- and I noticed {company} is taking a {dims} ({sqft:,} sq ft) at {show}, Booth {booth}.\n\n"
+            f"For a company your size that is usually a 'we need to be in the room' booth rather than the presence "
+            f"you'd bring to a flagship show. Nothing wrong with that. But the bigger build is coming at some point, "
+            f"at this show or the next one, and that is the conversation we'd like to be on the shortlist for. "
+            f"{angle}\n\n"
+            f"Two things we'd like to put on the table up front:\n\n"
+            f"1. A complimentary 3D LED rendering of what a {render_dims} could look like for {company}: LED wall, "
+            f"lighting and demo stations designed around your product line, so the next budget conversation starts "
+            f"from a picture rather than a line item. Yours to keep either way.\n"
+            f"{build_point}\n\n"
+            f"You can see our custom fabrication and turnkey rental work at {COMPANY_SITE}.\n\n"
+            f"Would a 15-minute call next week make sense to talk through where {show} sits in your 2027 plans?\n\n"
+            f"{signature}"
+        )
+        subject1 = f"{company} at {show}: beyond the {dims} (Booth {booth})"
+        offer_line = f"a free 3D LED rendering of a {render_dims} build for {company}"
+    else:
+        touch1 = (
+            f"{greeting}\n\n"
+            f"{hook} -- and I noticed {company} has a {dims} ({sqft:,} sq ft) space at {show}, Booth {booth}.\n\n"
+            f"That footprint is the sweet spot where a custom exhibit starts paying for itself in foot traffic, "
+            f"and it's the size we build most for {industry.lower()} exhibitors. {angle}\n\n"
+            f"Two things we'd like to put on the table up front:\n\n"
+            f"1. A complimentary 3D LED rendering of your {dims} at {show}: LED wall, lighting and demo stations "
+            f"designed around your product line, so you can see how it lands on the floor before you commit to "
+            f"anything. Yours to keep either way.\n"
+            f"{build_point}\n\n"
+            f"You can see our custom fabrication and turnkey rental work at {COMPANY_SITE}.\n\n"
+            f"Would a 15-minute call next week make sense to talk through your {show} plans?\n\n"
+            f"{signature}"
+        )
+        subject1 = f"{company} at {show}: your {dims} space (Booth {booth})"
+        offer_line = f"a free 3D LED rendering of your {dims} at {show} (Booth {booth})"
+
     touch2 = (
         f"{greeting}\n\n"
-        f"Quick bump in case this got buried. The offer stands: a free 3D LED rendering of your {dims} at "
-        f"{show} (Booth {booth}), no strings attached.\n\n"
+        f"Quick bump in case this got buried. The offer stands: {offer_line}, no strings attached.\n\n"
         f"If someone else owns the {show} program on your side, could you point me their way?\n\n"
         f"{signature}"
     )
-    touch3 = (
-        f"{greeting}\n\n"
-        f"One more angle that's worth a minute. Exhibitors shipping a {dims} build into Las Vegas from out of "
-        f"state typically pay freight both ways, drayage on every crate, and a labor crew they've never met. "
-        f"Because we fabricate and store locally, your {show} exhibit gets built a few miles from {venue_txt} "
-        f"and installed by the same team that built it.\n\n"
-        f"That usually means fewer surprises on the show floor and a lower all-in number than a design-only "
-        f"quote suggests.\n\n"
-        f"Want me to put together a rough all-in estimate for a {dims} custom build versus a turnkey rental? "
-        f"One short call gets the inputs right.\n\n"
-        f"{signature}"
-    )
+    if local:
+        math_label, math_subject = "the Las Vegas math", f"The Las Vegas math on Booth {booth} at {show}"
+        touch3 = (
+            f"{greeting}\n\n"
+            f"One more angle that's worth a minute. Exhibitors shipping a {dims} build into Las Vegas from out of "
+            f"state typically pay freight both ways, drayage on every crate, and a labor crew they've never met. "
+            f"Because we fabricate and store locally, your {show} exhibit gets built a few miles from {venue_txt} "
+            f"and installed by the same team that built it.\n\n"
+            f"That usually means fewer surprises on the show floor and a lower all-in number than a design-only "
+            f"quote suggests.\n\n"
+            f"Want me to put together a rough all-in estimate for a {dims} custom build versus a turnkey rental? "
+            f"One short call gets the inputs right.\n\n"
+            f"{signature}"
+        )
+    else:
+        math_label, math_subject = "the multi-show math", f"The multi-show math on {company}'s exhibit program"
+        touch3 = (
+            f"{greeting}\n\n"
+            f"One more angle that's worth a minute. A build commissioned for a single show leaves its most "
+            f"expensive part, design and fabrication, on the table after four days. A build engineered to "
+            f"re-deploy across your calendar spreads that cost over every show you do, and when that calendar "
+            f"lands in Las Vegas, the busiest show city in the country, the crew that built it is the crew that "
+            f"installs it.\n\n"
+            f"That usually means a lower all-in number per show than a design-only quote suggests, and fewer "
+            f"surprises on the floor.\n\n"
+            f"Want me to put together a rough all-in estimate for a custom build versus a turnkey rental across "
+            f"your 2027 shows? One short call gets the inputs right.\n\n"
+            f"{signature}"
+        )
     touch4 = (
         f"{greeting}\n\n"
-        f"I'll close the loop here so I'm not cluttering your inbox. If a custom {dims} build or a turnkey "
-        f"rental for {show} comes up on your side, the 3D rendering offer stands -- just reply and we'll get "
-        f"it moving.\n\n"
+        f"I'll close the loop here so I'm not cluttering your inbox. If a custom build or a turnkey rental "
+        f"for {show}{' or the shows after it' if big_fish else ''} comes up on your side, the 3D rendering offer "
+        f"stands -- just reply and we'll get it moving.\n\n"
         f"Best of luck with the show.\n\n"
         f"{signature}"
     )
 
     return [
-        {"step": 1, "label": "Touch 1: timeline + render offer", "send_date": send_dates[0],
-         "subject": f"{company} at {show}: your {dims} space (Booth {booth})", "body": touch1},
+        {"step": 1, "label": "Touch 1: timeline + render offer" + (" (big fish)" if big_fish else ""), "send_date": send_dates[0],
+         "subject": subject1, "body": touch1},
         {"step": 2, "label": "Touch 2: bump (+4 days)", "send_date": send_dates[1],
-         "subject": f"Re: {company} at {show}: your {dims} space (Booth {booth})", "body": touch2},
-        {"step": 3, "label": "Touch 3: the Las Vegas math (+10 days)", "send_date": send_dates[2],
-         "subject": f"The Las Vegas math on Booth {booth} at {show}", "body": touch3},
+         "subject": f"Re: {subject1}", "body": touch2},
+        {"step": 3, "label": f"Touch 3: {math_label} (+10 days)", "send_date": send_dates[2],
+         "subject": math_subject, "body": touch3},
         {"step": 4, "label": "Touch 4: close the loop (+18 days)", "send_date": send_dates[3],
          "subject": f"Closing the loop on {show}", "body": touch4},
     ]
@@ -1536,6 +1699,7 @@ def inject_css() -> None:
         .ax-muted { opacity: .7; font-size: .85rem; }
         .ax-legend { display:inline-block; width: 12px; height: 12px; border-radius: 3px;
                      background: rgba(34,197,94,.35); border: 1px solid rgba(34,197,94,.7); vertical-align: middle; }
+        .ax-legend-big { background: rgba(245,158,11,.35); border-color: rgba(245,158,11,.7); }
         .ax-step { font-size: .8rem; opacity: .75; margin-bottom: .2rem; }
         div[data-testid="stMetric"] { padding: .2rem .4rem; }
         </style>
@@ -1549,8 +1713,8 @@ def render_header() -> None:
         f"""
         <div class="ax-header">
             <h1>{COMPANY_NAME} &middot; {TAGLINE}</h1>
-            <p>Paste an exhibitor directory, find the mid-market booths worth a custom 3D LED build,
-               and generate a timed outreach sequence for each one.</p>
+            <p>Any convention, any city: pull the exhibitor list, find the mid-market booths and the big fish
+               in small booths worth a custom 3D LED build, and generate a timed outreach sequence for each one.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1592,7 +1756,11 @@ def render_sidebar() -> dict:
             help="Estimated annual revenue in millions of USD.",
         )
         st.slider("Employee count", min_value=10, max_value=2000, step=10, key="headcount_range")
-        st.checkbox("Show only Goldilocks matches", key="only_goldilocks")
+        st.checkbox("Also qualify big fish (large company, small booth)", key="big_fish",
+                    help="A company above the revenue floor below in any booth up to the Goldilocks ceiling. "
+                         "They are at the show because they have to be; the flagship build comes later.")
+        st.number_input("Big-fish revenue floor ($M)", min_value=10, max_value=5000, step=10, key="big_fish_min_revenue")
+        st.checkbox("Show only qualified leads", key="only_goldilocks")
         st.button("Reset to defaults", on_click=reset_filters)
 
         st.divider()
@@ -1617,12 +1785,13 @@ def render_sidebar() -> dict:
         }
 
         st.divider()
-        secret_key = ""
+        secret_key, secret_tavily = "", ""
         try:
             secret_key = st.secrets.get("APOLLO_API_KEY", "")  # .streamlit/secrets.toml or Cloud secrets
+            secret_tavily = st.secrets.get("TAVILY_API_KEY", "")
         except Exception:
-            secret_key = ""
-        with st.expander("Enrichment settings (optional)", expanded=False):
+            pass
+        with st.expander("Enrichment & search keys (optional)", expanded=False):
             st.caption(
                 "Without a key, revenue and headcount are modelled. With an Apollo.io master API key the top "
                 "leads (the number above) go through Apollo after each scrape: organisation enrichment and "
@@ -1633,9 +1802,13 @@ def render_sidebar() -> dict:
                                        help="Apollo -> Settings -> Integrations -> API -> Create new key "
                                             "(tick 'master API key'). On Streamlit Cloud, store it under "
                                             "App settings -> Secrets as APOLLO_API_KEY.")
+            tavily_key = st.text_input("Tavily API key", value=secret_tavily, type="password",
+                                       help="Web search: finds any convention's exhibitor directory by name and "
+                                            "backs up the website lookup. Store it as TAVILY_API_KEY.")
             st.caption("Target titles, in order: " + ", ".join(TARGET_TITLES))
-        if secret_key:
-            st.caption("Apollo key loaded from secrets: live enrichment on.")
+        loaded = [n for n, v in (("Apollo", secret_key), ("Tavily", secret_tavily)) if v]
+        if loaded:
+            st.caption(" and ".join(loaded) + " key" + ("s" if len(loaded) > 1 else "") + " loaded from secrets.")
 
     return {
         "booth_range": st.session_state["booth_range"],
@@ -1643,9 +1816,12 @@ def render_sidebar() -> dict:
         "headcount_range": st.session_state["headcount_range"],
         "only_goldilocks": st.session_state["only_goldilocks"],
         "price_per_sqft": st.session_state["price_per_sqft"],
+        "big_fish": bool(st.session_state["big_fish"]),
+        "big_fish_min_revenue": float(st.session_state["big_fish_min_revenue"]),
         "website_cap": int(website_cap),
         "sender": sender,
         "apollo_key": apollo_key.strip() or None,
+        "tavily_key": tavily_key.strip() or None,
     }
 
 
@@ -1754,7 +1930,8 @@ def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, params: dic
             st.write(f"Apollo: domain lookup, organisation enrichment and people search for the top {len(top)} leads...")
             abar = st.progress(0.0, text="Apollo")
             stats = apply_apollo(leads, apollo_key, list(top["Company"]),
-                                 progress=lambda d, t, c: abar.progress(d / t, text=f"{d}/{t}  {c}"))
+                                 progress=lambda d, t, c: abar.progress(d / t, text=f"{d}/{t}  {c}"),
+                                 tavily_key=params.get("tavily_key"))
             abar.progress(1.0, text="Apollo pass complete")
             st.write(f"Apollo matched {stats['orgs']} of {stats['tried']} companies "
                      f"({stats['domains']} domains found by name, {stats['contacts']} decision-makers found).")
@@ -1792,7 +1969,7 @@ def fetch_more_websites(cap: int, params: dict) -> None:
             leads["Website"] = [site_map.get(c, w) or w for c, w in zip(leads["Company"], leads["Website"])]
     if params.get("apollo_key"):
         with st.spinner(f"Apollo: enriching {len(top)} leads..."):
-            apply_apollo(leads, params["apollo_key"], list(top["Company"]))
+            apply_apollo(leads, params["apollo_key"], list(top["Company"]), tavily_key=params.get("tavily_key"))
     st.session_state["leads"] = leads
 
 
@@ -1806,18 +1983,48 @@ def render_empty_state() -> None:
         st.markdown("**How to use this**")
         st.markdown(
             """
-            1. Pick a target show (NAB Show 2027 fills its directory in automatically) or paste any exhibitor-list
-               URL. MapYourShow directories (`https://<show>.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm`)
+            1. Pick a target show (NAB Show 2027 fills its directory in automatically), paste any exhibitor-list
+               URL, or type a show name into the finder above to locate its directory anywhere in the country.
+               MapYourShow directories (`https://<show>.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm`)
                return the full exhibitor list plus exact booth footprints from the floor plan.
             2. Click **Scrape & Analyze**. Every row is a real exhibitor; revenue and headcount are modelled until
                an Apollo key is added in the sidebar.
-            3. Tune the Goldilocks filter, click a row, and the 4-touch sequence is ready to send.
+            3. Two ways to qualify: Goldilocks (mid-market booth, revenue and headcount all in range) and big fish
+               (a large company in a small booth -- the flagship build comes later). Click a row and the 4-touch
+               sequence is ready to send.
             """
         )
-    st.markdown("#### Target shows: Las Vegas, March - June 2027")
+    st.markdown("#### Target shows on the calendar: Las Vegas, March - June 2027")
     render_show_calendar()
-    with st.expander("Other Las Vegas directories already live on MapYourShow"):
+    with st.expander("Other directories already live on MapYourShow"):
         st.markdown("\n".join(f"- {name}: `{link}`" for name, link in KNOWN_DIRECTORIES))
+
+
+def render_directory_finder(tavily_key: str | None) -> None:
+    """Show name -> exhibitor directory URL, for any convention in the country (Tavily web search)."""
+    with st.expander("Find a show's exhibitor directory by name (any city)", expanded=False):
+        if not tavily_key:
+            st.caption("Add a Tavily API key in the sidebar (or TAVILY_API_KEY in secrets) to search for "
+                       "directories by show name. Until then, paste the directory URL below.")
+            return
+        c1, c2 = st.columns([4, 1.2])
+        query = c1.text_input("Show name", placeholder="IMTS 2026 Chicago", label_visibility="collapsed")
+        c2.markdown("<div style='height:.1rem'></div>", unsafe_allow_html=True)
+        if c2.button("Find directory", **_wide(st.button)) and query.strip():
+            with st.spinner("Searching..."):
+                st.session_state["dir_candidates"] = find_directories_tavily(query.strip(), tavily_key)
+                st.session_state["dir_query"] = query.strip()
+        candidates = st.session_state.get("dir_candidates") or []
+        if st.session_state.get("dir_query") and not candidates:
+            st.info("No exhibitor directory found for that name. Try the show's full name and year, or paste its URL below.")
+        if candidates:
+            labels = [f"{c['platform']}  |  {c['title'][:70]}  |  {c['host']}" for c in candidates]
+            pick = st.radio("Directories found (MapYourShow first: exact booth sizes)", labels, index=0)
+            chosen = candidates[labels.index(pick)]
+            st.code(chosen["url"], language="text")
+            if st.button("Use this directory"):
+                st.session_state["url_prefill"] = chosen["url"]
+                st.rerun()
 
 
 def main() -> None:
@@ -1828,10 +2035,12 @@ def main() -> None:
     params = render_sidebar()
 
     # ---- Module 1: URL input -------------------------------------------------
+    render_directory_finder(params.get("tavily_key"))
     with st.form("scrape_form", clear_on_submit=False):
         c_url, c_show = st.columns([4, 2])
         url = c_url.text_input(
             "Enter Trade Show Directory URL (e.g., MapYourShow / A2Z Events)",
+            value=st.session_state.get("url_prefill", ""),
             placeholder="https://nab27.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false",
             help="Leave blank after picking a target show that has a published directory (NAB Show 2027) "
                  "and the app uses that directory.",
@@ -1866,8 +2075,8 @@ def main() -> None:
     with st.expander("Target shows: Las Vegas, March - June 2027", expanded=False):
         render_show_calendar()
 
-    # ---- Result header: source badge, convention name + date, export --------
-    h1, h2, h3, h4 = st.columns([2.8, 1.8, 1.3, 1.1])
+    # ---- Result header: source badge, convention name, venue, date, export --
+    h1, h2, h3, h4, h5 = st.columns([2.3, 1.7, 1.4, 1.3, 1.0])
     with h1:
         badge = ("<span class='ax-badge ax-live'>Live scrape</span>"
                  f"<span class='ax-badge ax-neutral'>{meta['platform']}</span>")
@@ -1882,19 +2091,25 @@ def main() -> None:
     with h2:
         convention = st.text_input("Convention name (used in emails)", value=meta["convention"], key=f"conv_{state_key}").strip() or meta["convention"]
     with h3:
+        default_venue = meta.get("venue") or SHOW_BY_NAME.get(convention, {}).get("venue", "")
+        venue = st.text_input("Venue / city", value=default_venue, key=f"venue_{state_key}",
+                              placeholder="McCormick Place, Chicago",
+                              help="Las Vegas venues get the home-turf pitch; any other city gets the build-that-travels pitch.").strip()
+    with h4:
         show_date = st.date_input("Show start date", value=meta.get("show_date"), key=f"date_{state_key}",
                                   help="Drives the outreach window and the send dates in the sequence.")
         if isinstance(show_date, (list, tuple)):
             show_date = show_date[0] if show_date else None
-    venue = meta.get("venue") or (SHOW_BY_NAME.get(convention, {}).get("venue", ""))
     timeline = outreach_timeline(show_date)
 
     # ---- Module 2: scoring ---------------------------------------------------
     scored = score_leads(leads, params)
-    qualified = scored[scored["Goldilocks"]]
+    qualified = scored[scored["Qualified"]]
+    n_gold = int(scored["Goldilocks"].sum())
+    n_big = int(scored["Big Fish"].sum())
     pipeline_value = int(qualified["Est. Deal ($)"].sum())
 
-    with h4:
+    with h5:
         st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
         st.download_button(
             "Export leads CSV",
@@ -1907,11 +2122,16 @@ def main() -> None:
     with k1, st.container(border=True):
         st.metric("Total companies scraped", f"{len(scored):,}")
     with k2, st.container(border=True):
-        st.metric("Goldilocks qualified leads", f"{len(qualified):,}",
-                  delta=f"{len(qualified) / len(scored):.0%} of list" if len(scored) else None, delta_color="off")
+        st.metric("Qualified leads", f"{len(qualified):,}",
+                  delta=(f"{n_gold} Goldilocks + {n_big} big fish" if params.get("big_fish")
+                         else f"{len(qualified) / len(scored):.0%} of list") if len(scored) else None,
+                  delta_color="off",
+                  help="Goldilocks: booth, revenue and headcount all in range. Big fish: above the revenue floor "
+                       "in a booth no bigger than the Goldilocks ceiling (the flagship build comes later).")
     with k3, st.container(border=True):
         st.metric("Estimated pipeline value", fmt_money(pipeline_value),
-                  help=md(f"Sum of booth sq ft x ${params['price_per_sqft']}/sq ft across qualified leads."))
+                  help=md(f"Sum of booth sq ft x ${params['price_per_sqft']}/sq ft across qualified leads; "
+                          f"big fish are valued at the mid-market floor ({params['booth_range'][0]} sq ft)."))
     with k4, st.container(border=True):
         if timeline["days_out"] is not None:
             st.metric("Outreach window", timeline["label"], delta=f"{timeline['days_out']} days to {convention}", delta_color="off",
@@ -1924,12 +2144,12 @@ def main() -> None:
     st.markdown("#### Lead grid")
     f1, f2 = st.columns([3, 1.5])
     search = f1.text_input("Search company, industry or contact", value="", placeholder="e.g. audio, streaming, Lumen")
-    tier_options = ["Goldilocks", "Near miss", "Out of range", "No booth data"]
+    tier_options = ["Goldilocks", "Big fish", "Near miss", "Out of range", "No booth data"]
     tiers = f2.multiselect("Tier", tier_options, default=tier_options[:3])
 
     view = scored.copy()
     if params["only_goldilocks"]:
-        view = view[view["Goldilocks"]]
+        view = view[view["Qualified"]]
     if tiers:
         view = view[view["Tier"].isin(tiers)]
     if search:
@@ -1945,7 +2165,8 @@ def main() -> None:
     near = int((scored["Tier"] == "Near miss").sum())
     nodata = int((scored["Tier"] == "No booth data").sum())
     st.markdown(
-        f"<span class='ax-legend'></span> <span class='ax-muted'>Green rows meet all three Goldilocks criteria "
+        f"<span class='ax-legend'></span> <span class='ax-muted'>Green rows meet all three Goldilocks criteria; </span>"
+        f"<span class='ax-legend ax-legend-big'></span> <span class='ax-muted'>amber rows are big fish "
         f"({near} near-miss leads also worth a call; {nodata} exhibitors have no booth on the floor plan yet). "
         f"Click a row to open the outreach sequence.</span>",
         unsafe_allow_html=True,
@@ -1959,8 +2180,11 @@ def main() -> None:
     grid_df["Est. Deal ($)"] = grid_df["Est. Deal ($)"].where(grid_df["Est. Deal ($)"] > 0)
 
     def highlight(row: pd.Series) -> list[str]:
-        is_match = bool(view.loc[row.name, "Goldilocks"])
-        return ["background-color: rgba(34,197,94,0.20)" if is_match else ""] * len(row)
+        if bool(view.loc[row.name, "Goldilocks"]):
+            return ["background-color: rgba(34,197,94,0.20)"] * len(row)
+        if bool(view.loc[row.name, "Big Fish"]):
+            return ["background-color: rgba(245,158,11,0.18)"] * len(row)
+        return [""] * len(row)
 
     styler = grid_df.style.apply(highlight, axis=1).format({"Revenue ($M)": "{:,.1f}", "Est. Deal ($)": "${:,.0f}"}, na_rep="")
 
@@ -1994,10 +2218,10 @@ def main() -> None:
         st.dataframe(styler, **grid_kwargs)
 
     if params.get("apollo_key"):
-        missing = int(((scored["Enrichment"] != "Apollo") & scored["Goldilocks"]).sum())
+        missing = int(((scored["Enrichment"] != "Apollo") & scored["Qualified"]).sum())
         verb, note = "Run Apollo on next", "qualified leads have not been through Apollo yet (1-2 credits each)."
     else:
-        missing = int(((scored["Website"] == "") & (scored["Detail URL"] != "") & scored["Goldilocks"]).sum()) if "Detail URL" in scored.columns else 0
+        missing = int(((scored["Website"] == "") & (scored["Detail URL"] != "") & scored["Qualified"]).sum()) if "Detail URL" in scored.columns else 0
         verb, note = "Look up websites for next", "qualified leads still need a website (one detail-page request each)."
     if missing:
         w1, w2 = st.columns([1.8, 5])
@@ -2041,12 +2265,17 @@ def main() -> None:
             booth_line = (f"{range_note(lead['Sq Ft'], b_lo, b_hi, ' sq ft')} ({lead['Booth Size']})"
                           if lead["Sq Ft"] else "not on the floor plan yet (no booth data)")
             hall_line = f"\n- Hall: {lead['Hall']}" if str(lead.get("Hall") or "") else ""
+            if lead["Tier"] == "Big fish":
+                st.markdown(md(f"Big fish: ${lead['Revenue ($M)']:,.0f}M of revenue in a {lead['Booth Size']}. "
+                               f"They are here because they have to be; the flagship build is the pitch."))
             st.markdown(md(
                 f"- Booth: {booth_line}{hall_line}\n"
                 f"- Revenue: {range_note(lead['Revenue ($M)'], r_lo, r_hi, 'M', '${:,.1f}')}\n"
                 f"- Headcount: {range_note(lead['Headcount'], h_lo, h_hi, ' employees')}\n"
                 f"- Industry: {lead['Industry']}\n"
-                f"- Est. deal: {fmt_money(lead['Est. Deal ($)'])} ({int(lead['Sq Ft'])} sq ft x ${params['price_per_sqft']}/sq ft)\n"
+                f"- Est. deal: {fmt_money(lead['Est. Deal ($)'])} "
+                f"({int(lead['Est. Deal ($)']) // max(int(params['price_per_sqft']), 1)} sq ft x ${params['price_per_sqft']}/sq ft"
+                f"{', mid-market floor' if lead['Tier'] == 'Big fish' else ''})\n"
                 f"- Data: booth size from {lead['Size Source']}, revenue/headcount {lead['Enrichment']}"
             ))
             if str(lead.get("Description") or ""):
