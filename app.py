@@ -563,11 +563,21 @@ def mys_base(url: str) -> tuple[str, str]:
     return f"{p.scheme or 'https'}://{p.netloc}", (m.group(1) if m else "8_0")
 
 
-def _mys_json(url: str, params: dict, referer: str) -> dict:
+MYS_SESSION = requests.Session()  # keeps the site's cookies between the gallery and floor-plan calls
+
+
+def _mys_get(url: str, params: dict, referer: str) -> requests.Response:
+    origin = f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"
+    headers = {**MYS_JSON_HEADERS, "Referer": referer, "Origin": origin,
+               "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}
     try:
-        resp = requests.get(url, params=params, headers={**MYS_JSON_HEADERS, "Referer": referer}, timeout=REQUEST_TIMEOUT * 3)
+        return MYS_SESSION.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT * 3)
     except requests.exceptions.RequestException as exc:
         raise ScrapeError(f"MapYourShow request failed: {exc.__class__.__name__}")
+
+
+def _mys_json(url: str, params: dict, referer: str) -> dict:
+    resp = _mys_get(url, params, referer)
     if resp.status_code != 200:
         raise ScrapeError(f"MapYourShow returned HTTP {resp.status_code} for {params.get('action', 'request')}")
     try:
@@ -576,13 +586,29 @@ def _mys_json(url: str, params: dict, referer: str) -> dict:
         raise ScrapeError("MapYourShow returned a non-JSON response (has the show code changed?)")
 
 
+# Per-hall diagnostics for the last floor-plan pull (shown in the status log
+# when a show comes back with no booth geometry, so the reason is visible).
+FLOORPLAN_DIAG: list[dict] = []
+
+
 def _mys_booths_for_hall(booth_url: str, showid: str, hall: str, referer: str) -> list[dict]:
     """All booth records in one hall, with dimensions parsed out of FEATUREPROPERTIES."""
-    data = _mys_json(booth_url, {"showid": showid, "selectedbooth": "", "hallid": hall,
-                                 "action": "GetBoothByHall", "method": "GetBoothByHall", "regid": 0}, referer)
+    resp = _mys_get(booth_url, {"showid": showid, "selectedbooth": "", "hallid": hall,
+                                "action": "GetBoothByHall", "method": "GetBoothByHall", "regid": 0}, referer)
+    diag = {"hall": hall, "url": booth_url, "status": resp.status_code,
+            "type": resp.headers.get("Content-Type", ""), "bytes": len(resp.content),
+            "head": resp.text[:240].replace("\n", " ")}
+    try:
+        data = resp.json() if resp.status_code == 200 else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
     cols = data.get("COLUMNS") or []
+    rows_raw = data.get("DATA") or []
+    diag.update({"rows": len(rows_raw), "cols": cols[:6]})
     out = []
-    for raw in data.get("DATA") or []:
+    for raw in rows_raw:
         rec = dict(zip(cols, raw))
         if rec.get("OBJECTTYPE") != "booth" or not rec.get("EXHID"):
             continue
@@ -610,6 +636,11 @@ def _mys_booths_for_hall(booth_url: str, showid: str, hall: str, referer: str) -
             "width_ft": round(float(width_in) / 12, 1) if width_in else None,
             "depth_ft": round(float(depth_in) / 12, 1) if depth_in else None,
         })
+    diag["booths_with_exhibitor"] = len(out)
+    FLOORPLAN_DIAG.append(diag)
+    print(f"[floorplan] {diag}")  # lands in the Streamlit Cloud log for debugging
+    if resp.status_code != 200:
+        raise ScrapeError(f"MapYourShow floor plan returned HTTP {resp.status_code} for hall {hall}")
     return out
 
 
@@ -659,8 +690,9 @@ def scrape_mapyourshow(url: str) -> tuple[list[dict], dict]:
     # 3. Show id + floor-plan app version (from the floor-plan page) ----------
     showid = urlparse(origin).netloc.split(".")[0].upper()
     fpver = "02"
+    fp_referer = f"{origin}/{root}/floorplan/"
     try:
-        fp_html = requests.get(f"{origin}/{root}/floorplan/", headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT).text
+        fp_html = MYS_SESSION.get(fp_referer, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT).text
         m = re.search(r'ShowID\s*=\s*"([^"]+)"', fp_html)
         if m:
             showid = m.group(1)
@@ -677,13 +709,14 @@ def scrape_mapyourshow(url: str) -> tuple[list[dict], dict]:
     wanted = sorted({h for ex in exhibitors.values() for h in ex["Halls"] if h in halls}) or list(halls)
     booths_by_exh: dict[str, list[dict]] = {}
     hall_errors = 0
+    FLOORPLAN_DIAG.clear()
     for ver in ["02"] + ([fpver] if fpver != "02" else []):
         booth_url = f"{origin}/{root}/floorplan/{ver}/_remote-proxy.cfm"
         booths_by_exh, hall_errors = {}, 0
         if not wanted:
             break
         with ThreadPoolExecutor(max_workers=MYS_MAX_WORKERS) as pool:
-            for result in pool.map(lambda h: _safe_hall(booth_url, showid, h, referer), wanted):
+            for result in pool.map(lambda h: _safe_hall(booth_url, showid, h, fp_referer), wanted):
                 if result is None:
                     hall_errors += 1
                     continue
@@ -760,6 +793,9 @@ def scrape_mapyourshow(url: str) -> tuple[list[dict], dict]:
         "halls": len(wanted),
         "hall_errors": hall_errors,
         "sized": sum(1 for r in rows if r["Size Source"] == "floorplan"),
+        "showid": showid,
+        "fpver": fpver,
+        "diag": list(FLOORPLAN_DIAG)[:4],
     }
     return rows, meta
 
@@ -779,7 +815,7 @@ def fetch_mys_website(detail_url: str) -> str:
     if not detail_url:
         return ""
     try:
-        resp = requests.get(detail_url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = MYS_SESSION.get(detail_url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             return ""
         m = WEBSITE_RE.search(resp.text)
@@ -1525,6 +1561,9 @@ def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, params: dic
             st.write(f"Exhibitor gallery: **{len(rows)}** companies. Floor plan: **{meta['sized']}** with exact booth "
                      f"footprints across {meta['halls']} halls"
                      + (f" ({meta['hall_errors']} halls could not be read)" if meta["hall_errors"] else "") + ".")
+            if not meta["sized"] and live_meta.get("diag"):
+                st.write(f"Floor-plan diagnostics (show id `{live_meta.get('showid')}`, app version `{live_meta.get('fpver')}`):")
+                st.code("\n".join(str(d) for d in live_meta["diag"]), language="text")
         else:
             st.write(f"Parsed **{len(rows)}** exhibitors from {meta['platform']} "
                      f"({meta['sized']} with booth dimensions on the page).")
@@ -1638,6 +1677,9 @@ def main() -> None:
     if leads is None or meta is None:
         render_empty_state()
         return
+    for col in ("Hall", "Description", "Detail URL", "Contact", "Website"):
+        if col not in leads.columns:  # session data from an older build of the app
+            leads[col] = ""
 
     with st.expander("Target shows: Las Vegas, March - June 2027", expanded=False):
         render_show_calendar()
