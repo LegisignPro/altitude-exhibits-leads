@@ -613,6 +613,11 @@ def _mys_booths_for_hall(booth_url: str, showid: str, hall: str, referer: str) -
     return out
 
 
+def _strip_booth(value) -> str:
+    """Gallery booth numbers arrive as 'C8520randomstring' -- MapYourShow pads them; the floor plan has the clean value."""
+    return re.sub(r"randomstring$", "", _clean(str(value or "")), flags=re.I)
+
+
 def _fmt_ft(v: float | None) -> str:
     return "" if v is None else (f"{int(v)}" if float(v).is_integer() else f"{v:g}")
 
@@ -644,7 +649,7 @@ def scrape_mapyourshow(url: str) -> tuple[list[dict], dict]:
         exhibitors[exhid] = {
             "exhid": exhid,
             "Company": name,
-            "Booth": ", ".join(str(b) for b in (f.get("boothsdisplay_la") or f.get("booths_la") or [])),
+            "Booth": ", ".join(_strip_booth(b) for b in (f.get("boothsdisplay_la") or f.get("booths_la") or []) if _strip_booth(b)),
             "Halls": [str(h) for h in (f.get("hallid_la") or [])],
             "Description": _clean(str(f.get("exhdesc_t") or ""))[:400],
         }
@@ -666,11 +671,17 @@ def scrape_mapyourshow(url: str) -> tuple[list[dict], dict]:
         pass  # fall back to the subdomain-derived show id
 
     # 4. Booth geometry, hall by hall (only halls that actually hold exhibitors)
+    # The legacy "02" floor-plan proxy answers for every show we have seen,
+    # including shows whose public floor plan already runs the newer "03" app
+    # (NAB 2027), so it goes first; the detected version is the fallback.
     wanted = sorted({h for ex in exhibitors.values() for h in ex["Halls"] if h in halls}) or list(halls)
-    booth_url = f"{origin}/{root}/floorplan/{fpver}/_remote-proxy.cfm"
     booths_by_exh: dict[str, list[dict]] = {}
     hall_errors = 0
-    if wanted:
+    for ver in ["02"] + ([fpver] if fpver != "02" else []):
+        booth_url = f"{origin}/{root}/floorplan/{ver}/_remote-proxy.cfm"
+        booths_by_exh, hall_errors = {}, 0
+        if not wanted:
+            break
         with ThreadPoolExecutor(max_workers=MYS_MAX_WORKERS) as pool:
             for result in pool.map(lambda h: _safe_hall(booth_url, showid, h, referer), wanted):
                 if result is None:
@@ -678,6 +689,8 @@ def scrape_mapyourshow(url: str) -> tuple[list[dict], dict]:
                     continue
                 for b in result:
                     booths_by_exh.setdefault(b["exhid"], []).append(b)
+        if booths_by_exh:
+            break
 
     # 5. Join ----------------------------------------------------------------
     rows = []
