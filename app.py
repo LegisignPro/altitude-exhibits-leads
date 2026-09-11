@@ -932,21 +932,66 @@ def simulate_enrichment(company: str, sqft: int, description: str = "") -> dict:
     }
 
 
+def _apollo_headers(api_key: str) -> dict:
+    return {"x-api-key": api_key, "accept": "application/json", "Cache-Control": "no-cache",
+            "Content-Type": "application/json"}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def find_domain_apollo(company: str, api_key: str) -> str:
+    """
+    PRODUCTION PATH -- Apollo Organization Search, company name -> domain.
+
+    Trade-show directories rarely publish a website (NAB's do not), and every
+    other Apollo call is keyed on the domain, so this runs first for leads
+    without one.
+
+    Endpoint: POST https://api.apollo.io/api/v1/mixed_companies/search
+    Query:    q_organization_name=<company>&page=1&per_page=1
+    Header:   x-api-key: <master key>
+    Cost:     1 credit per call (per page). Cached 24h.
+    Mapped:   organizations[0].primary_domain (fallback: website_url host)
+    """
+    if not company or not api_key:
+        return ""
+    try:
+        resp = requests.post(
+            "https://api.apollo.io/api/v1/mixed_companies/search",
+            params={"q_organization_name": company, "page": 1, "per_page": 1},
+            headers=_apollo_headers(api_key), timeout=10,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        orgs = body.get("organizations") or body.get("accounts") or []
+        if not orgs:
+            return ""
+        org = orgs[0]
+        domain = str(org.get("primary_domain") or "").strip()
+        if not domain:
+            domain = urlparse(str(org.get("website_url") or "")).netloc.replace("www.", "")
+        return domain
+    except Exception:
+        return ""
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def enrich_company_apollo(domain: str, api_key: str) -> dict | None:
     """
     PRODUCTION PATH -- real Apollo.io organisation enrichment.
 
     How to wire it up:
-      1. Get a key at https://app.apollo.io/#/settings/integrations/api
-      2. Put it in .streamlit/secrets.toml:
+      1. Create a key at https://app.apollo.io/#/settings/integrations/api
+         (tick "Set as master API key": search + enrichment endpoints need it)
+      2. Put it in .streamlit/secrets.toml (locally) or App settings -> Secrets
+         on Streamlit Community Cloud:
              APOLLO_API_KEY = "xxxxxxxx"
          (or paste it in the sidebar for a one-off session)
-      3. That's it -- enrich_companies() calls this function automatically
-         whenever a key is present and a website/domain was scraped.
+      3. That's it -- after a scrape, apply_apollo() runs this for the top
+         leads: domain lookup (if needed) -> organisation enrich -> people search.
 
     Endpoint: GET https://api.apollo.io/api/v1/organizations/enrich?domain=acme.com
     Header:   x-api-key: <key>
+    Cost:     1 credit per organisation. Cached 24h so re-runs don't burn credits.
     Response fields we map:
         organization.annual_revenue          -> Revenue ($M)   (raw dollars / 1e6)
         organization.estimated_num_employees -> Headcount
@@ -960,7 +1005,6 @@ def enrich_company_apollo(domain: str, api_key: str) -> dict | None:
     Rate limits: Apollo allows ~50 enrich calls/min on entry plans, so for a
     2,000-exhibitor show you would batch this (Apollo also has a bulk endpoint:
     POST /api/v1/organizations/bulk_enrich with up to 10 domains per call).
-    Results are cached for 24h so re-runs don't burn credits.
     """
     if not domain or not api_key:
         return None
@@ -968,7 +1012,7 @@ def enrich_company_apollo(domain: str, api_key: str) -> dict | None:
         resp = requests.get(
             "https://api.apollo.io/api/v1/organizations/enrich",
             params={"domain": domain},
-            headers={"x-api-key": api_key, "Cache-Control": "no-cache", "Content-Type": "application/json"},
+            headers=_apollo_headers(api_key),
             timeout=10,
         )
         resp.raise_for_status()
@@ -995,13 +1039,16 @@ def find_contact_apollo(domain: str, titles: tuple[str, ...], api_key: str) -> d
     who actually owns the trade-show budget.
 
     Endpoint: POST https://api.apollo.io/api/v1/mixed_people/search
-    Body:     {"q_organization_domains": "acme.com",
-               "person_titles": ["Trade Show Manager", "Event Marketing Manager", ...],
-               "page": 1, "per_page": 3}
-    Header:   x-api-key: <key>
+    Query:    q_organization_domains_list[]=acme.com
+              person_titles[]=Trade Show Manager&person_titles[]=Event Marketing Manager ...
+              page=1&per_page=3
+    Header:   x-api-key: <key>   (use a *master* key: Apollo restricts the
+              search + enrichment endpoints to master keys on most plans)
 
-    The search result includes name + title + LinkedIn URL. Verified email
-    addresses cost a credit each and come from a second call:
+    The search result includes name + title + LinkedIn URL. Apollo does not
+    hand out the email here (it returns a placeholder such as
+    email_not_unlocked@domain.com); a verified address costs a credit and
+    comes from a second call:
         POST https://api.apollo.io/api/v1/people/match  {"id": <person id>, "reveal_personal_emails": false}
     Clay users: the same two steps are the "Find people at company" and
     "Enrich person" columns.
@@ -1011,8 +1058,8 @@ def find_contact_apollo(domain: str, titles: tuple[str, ...], api_key: str) -> d
     try:
         resp = requests.post(
             "https://api.apollo.io/api/v1/mixed_people/search",
-            json={"q_organization_domains": domain, "person_titles": list(titles), "page": 1, "per_page": 3},
-            headers={"x-api-key": api_key, "Cache-Control": "no-cache", "Content-Type": "application/json"},
+            params={"q_organization_domains_list[]": [domain], "person_titles[]": list(titles), "page": 1, "per_page": 3},
+            headers=_apollo_headers(api_key),
             timeout=10,
         )
         resp.raise_for_status()
@@ -1020,46 +1067,90 @@ def find_contact_apollo(domain: str, titles: tuple[str, ...], api_key: str) -> d
         if not people:
             return None
         person = people[0]
+        email = str(person.get("email") or "")
+        if "email_not_unlocked" in email or "@" not in email:
+            email = ""  # placeholder until the person is enriched (1 credit)
         return {
             "Contact": person.get("name") or f"{person.get('first_name', '')} {person.get('last_name', '')}".strip(),
             "Contact Title": person.get("title") or "",
-            "Contact Email": person.get("email") or "",
+            "Contact Email": email,
+            "Contact LinkedIn": person.get("linkedin_url") or "",
         }
     except Exception:
         return None
 
 
+CONTACT_COLUMNS = ("Contact", "Contact Title", "Contact Email", "Contact LinkedIn")
+
+
 def enrich_companies(rows: list[dict], api_key: str | None = None, progress=None) -> pd.DataFrame:
     """
-    Append Revenue / Headcount / Industry / decision-maker targeting to every
-    scraped row.
+    Baseline pass: append modelled Revenue / Headcount / Industry and the
+    decision-maker titles to every scraped row so the whole show can be
+    scored at once. Contacts start blank -- the app never invents a person.
 
-    With no API key, revenue and headcount are simulated. With a key, Apollo is
-    tried first and simulation only fills gaps (missing domain, no match, API
-    error). Contacts come from Apollo People Search when a key and a domain
-    are available; otherwise they stay blank -- the app never invents a person.
+    The live Apollo pass (apply_apollo) runs afterwards on the top-scoring
+    leads only, because every Apollo call costs credits and a 4,000-exhibitor
+    show does not need 4,000 of them. `api_key` is accepted for backwards
+    compatibility; the pipeline passes it to apply_apollo instead.
     """
     enriched = []
     for i, row in enumerate(rows):
-        domain = urlparse(row.get("Website") or "").netloc.replace("www.", "")
         sim = simulate_enrichment(row["Company"], int(row.get("Sq Ft") or 0), row.get("Description", ""))
-        result = enrich_company_apollo(domain, api_key) if (api_key and domain) else None
-        if result:
-            for k, v in sim.items():  # fill any blanks Apollo left
-                if result.get(k) in (None, ""):
-                    result[k] = v
-        else:
-            result = sim
-
-        titles = recommend_titles(int(result["Headcount"]))
-        contact = {"Contact": "", "Contact Title": "", "Contact Email": ""}
-        if api_key and domain:
-            contact = find_contact_apollo(domain, tuple(titles), api_key) or contact
-
-        enriched.append({**row, **result, **contact, "Target Titles": " > ".join(titles)})
+        titles = recommend_titles(int(sim["Headcount"]))
+        contact = {c: "" for c in CONTACT_COLUMNS}
+        enriched.append({**row, **sim, **contact, "Target Titles": " > ".join(titles)})
         if progress is not None and (i % 50 == 0 or i + 1 == len(rows)):
             progress(i + 1, len(rows), row["Company"])
     return pd.DataFrame(enriched)
+
+
+def apply_apollo(leads: pd.DataFrame, api_key: str, companies: list[str], progress=None) -> dict:
+    """
+    PRODUCTION PATH -- the live Apollo pass, in place, for the named companies:
+
+        1. no website from the directory?  -> find_domain_apollo()   (1 credit)
+        2. domain known                    -> enrich_company_apollo() (1 credit)
+           replaces the modelled revenue / headcount / industry
+        3. re-pick the target titles for the real headcount
+        4. find_contact_apollo() for those titles -> name, title, LinkedIn
+           (email stays blank until the person is enriched: 1 more credit)
+
+    Returns counts for the status log. Everything is cached for 24h, so
+    re-running the scrape or clicking "look up more" does not re-spend credits.
+    """
+    stats = {"domains": 0, "orgs": 0, "contacts": 0, "tried": 0}
+    wanted = set(companies)
+    idx = [i for i in leads.index if leads.at[i, "Company"] in wanted]
+    for n, i in enumerate(idx):
+        company = str(leads.at[i, "Company"])
+        website = str(leads.at[i, "Website"] or "")
+        domain = urlparse(website).netloc.replace("www.", "") if website else ""
+        if not domain:
+            domain = find_domain_apollo(company, api_key)
+            if domain:
+                leads.at[i, "Website"] = f"https://{domain}"
+                stats["domains"] += 1
+        if not domain:
+            continue
+        stats["tried"] += 1
+        org = enrich_company_apollo(domain, api_key)
+        if org:
+            for k in ("Revenue ($M)", "Headcount", "Industry"):
+                if org.get(k) not in (None, ""):
+                    leads.at[i, k] = org[k]
+            leads.at[i, "Enrichment"] = "Apollo"
+            stats["orgs"] += 1
+        titles = recommend_titles(int(leads.at[i, "Headcount"]))
+        leads.at[i, "Target Titles"] = " > ".join(titles)
+        contact = find_contact_apollo(domain, tuple(titles), api_key)
+        if contact:
+            for k, v in contact.items():
+                leads.at[i, k] = v
+            stats["contacts"] += 1
+        if progress is not None:
+            progress(n + 1, len(idx), company)
+    return stats
 
 
 # =============================================================================
@@ -1314,6 +1405,8 @@ def build_campaign_export(leads: pd.DataFrame, show: str, show_start: date | Non
             "Contact": lead.get("Contact", ""),
             "Contact Title": lead.get("Contact Title", ""),
             "Contact Email": lead.get("Contact Email", ""),
+            "Contact LinkedIn": lead.get("Contact LinkedIn", ""),
+            "Data Source": lead.get("Enrichment", ""),
         }
         for step in seq:
             n = step["step"]
@@ -1476,18 +1569,24 @@ def render_sidebar() -> dict:
         }
 
         st.divider()
-        with st.expander("Enrichment settings (optional)"):
-            st.caption(
-                "Without a key, enrichment is simulated. Paste an Apollo.io API key to replace the "
-                "simulation with live organisation lookups and people search for the target titles."
-            )
+        secret_key = ""
+        try:
+            secret_key = st.secrets.get("APOLLO_API_KEY", "")  # .streamlit/secrets.toml or Cloud secrets
+        except Exception:
             secret_key = ""
-            try:
-                secret_key = st.secrets.get("APOLLO_API_KEY", "")  # .streamlit/secrets.toml
-            except Exception:
-                secret_key = ""
-            apollo_key = st.text_input("Apollo API key", value=secret_key, type="password")
+        with st.expander("Enrichment settings (optional)", expanded=False):
+            st.caption(
+                "Without a key, revenue and headcount are modelled. With an Apollo.io master API key the top "
+                "leads (the number above) go through Apollo after each scrape: domain lookup, organisation "
+                "enrichment and people search for the target titles -- about 3 credits per company."
+            )
+            apollo_key = st.text_input("Apollo API key", value=secret_key, type="password",
+                                       help="Apollo -> Settings -> Integrations -> API -> Create new key "
+                                            "(tick 'master API key'). On Streamlit Cloud, store it under "
+                                            "App settings -> Secrets as APOLLO_API_KEY.")
             st.caption("Target titles, in order: " + ", ".join(TARGET_TITLES))
+        if secret_key:
+            st.caption("Apollo key loaded from secrets: live enrichment on.")
 
     return {
         "booth_range": st.session_state["booth_range"],
@@ -1579,14 +1678,14 @@ def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, params: dic
                      f"({meta['sized']} with booth dimensions on the page).")
 
         # ---- Enrichment ----------------------------------------------------
-        st.write("Enriching via Apollo API..." if apollo_key else "Enriching (simulated Apollo/Clearbit lookup)...")
+        st.write("Modelling revenue and headcount for every exhibitor (baseline)...")
         bar = st.progress(0.0, text="Starting enrichment")
 
         def on_progress(done: int, total: int, company: str) -> None:
             bar.progress(done / total, text=f"{done}/{total}  {company}")
 
-        leads = enrich_companies(rows, api_key=apollo_key, progress=on_progress)
-        bar.progress(1.0, text=f"Enriched {len(leads)} companies")
+        leads = enrich_companies(rows, progress=on_progress)
+        bar.progress(1.0, text=f"Modelled {len(leads)} companies")
 
         # ---- Websites for the top leads (MapYourShow detail pages) --------
         cap = int(params.get("website_cap") or 0)
@@ -1600,6 +1699,19 @@ def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, params: dic
                 leads["Website"] = [site_map.get(c, w) or w for c, w in zip(leads["Company"], leads["Website"])]
                 st.write(f"Found {sum(1 for s in sites if s)} websites.")
 
+        # ---- Live Apollo pass for the top leads ----------------------------
+        if apollo_key and cap:
+            top = score_leads(leads, params).head(cap)
+            st.write(f"Apollo: domain lookup, organisation enrichment and people search for the top {len(top)} leads...")
+            abar = st.progress(0.0, text="Apollo")
+            stats = apply_apollo(leads, apollo_key, list(top["Company"]),
+                                 progress=lambda d, t, c: abar.progress(d / t, text=f"{d}/{t}  {c}"))
+            abar.progress(1.0, text="Apollo pass complete")
+            st.write(f"Apollo matched {stats['orgs']} of {stats['tried']} companies "
+                     f"({stats['domains']} domains found by name, {stats['contacts']} decision-makers found).")
+            if not stats["tried"] and not stats["orgs"]:
+                st.warning("Apollo returned nothing. Check that the key is a master API key and the plan has API access.")
+
         meta["scraped_at"] = datetime.now().strftime("%b %d, %Y %I:%M %p")
         st.session_state["leads"] = leads
         st.session_state["meta"] = meta
@@ -1608,19 +1720,27 @@ def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, params: dic
 
 
 def fetch_more_websites(cap: int, params: dict) -> None:
-    """Button handler: fill in websites for the next batch of top leads that lack one."""
+    """Button handler: websites (and, with a key, Apollo data) for the next batch of top leads."""
     leads = st.session_state.get("leads")
     if leads is None or "Detail URL" not in leads.columns:
         return
     scored = score_leads(leads, params)
-    top = scored[(scored["Website"] == "") & (scored["Detail URL"] != "")].head(cap)
+    if params.get("apollo_key"):
+        top = scored[scored["Enrichment"] != "Apollo"].head(cap)
+    else:
+        top = scored[(scored["Website"] == "") & (scored["Detail URL"] != "")].head(cap)
     if not len(top):
         st.toast("Every ranked lead already has a website.")
         return
     with st.spinner(f"Looking up websites for {len(top)} leads..."):
-        sites = fetch_websites(list(top["Detail URL"]))
-    site_map = dict(zip(top["Company"], sites))
-    leads["Website"] = [site_map.get(c, w) or w for c, w in zip(leads["Company"], leads["Website"])]
+        need_site = top[(top["Website"] == "") & (top["Detail URL"] != "")]
+        if len(need_site):
+            sites = fetch_websites(list(need_site["Detail URL"]))
+            site_map = dict(zip(need_site["Company"], sites))
+            leads["Website"] = [site_map.get(c, w) or w for c, w in zip(leads["Company"], leads["Website"])]
+    if params.get("apollo_key"):
+        with st.spinner(f"Apollo: enriching {len(top)} leads..."):
+            apply_apollo(leads, params["apollo_key"], list(top["Company"]))
     st.session_state["leads"] = leads
 
 
@@ -1687,7 +1807,7 @@ def main() -> None:
     if leads is None or meta is None:
         render_empty_state()
         return
-    for col in ("Hall", "Description", "Detail URL", "Contact", "Website"):
+    for col in ("Hall", "Description", "Detail URL", "Website", "Enrichment", *CONTACT_COLUMNS):
         if col not in leads.columns:  # session data from an older build of the app
             leads[col] = ""
 
@@ -1821,13 +1941,18 @@ def main() -> None:
     else:  # very old Streamlit: no row selection, fall back to the selectbox only
         st.dataframe(styler, **grid_kwargs)
 
-    missing_sites = int(((scored["Website"] == "") & (scored["Detail URL"] != "") & scored["Goldilocks"]).sum()) if "Detail URL" in scored.columns else 0
-    if missing_sites:
+    if params.get("apollo_key"):
+        missing = int(((scored["Enrichment"] != "Apollo") & scored["Goldilocks"]).sum())
+        verb, note = "Run Apollo on next", "qualified leads have not been through Apollo yet (about 3 credits each)."
+    else:
+        missing = int(((scored["Website"] == "") & (scored["Detail URL"] != "") & scored["Goldilocks"]).sum()) if "Detail URL" in scored.columns else 0
+        verb, note = "Look up websites for next", "qualified leads still need a website (one detail-page request each)."
+    if missing:
         w1, w2 = st.columns([1.8, 5])
-        if w1.button(f"Look up websites for next {min(params['website_cap'] or 25, missing_sites)} leads", **_wide(st.button)):
+        if w1.button(f"{verb} {min(params['website_cap'] or 25, missing)} leads", **_wide(st.button)):
             fetch_more_websites(params["website_cap"] or 25, params)
             st.rerun()
-        w2.caption(f"{missing_sites} qualified leads still need a website (one detail-page request each).")
+        w2.caption(f"{missing} {note}")
 
     if view.empty:
         st.info("No leads match the current filters. Widen the Goldilocks ranges in the sidebar.")
@@ -1878,7 +2003,12 @@ def main() -> None:
                 st.markdown(f"[Directory listing]({lead['Detail URL']})")
             st.markdown("**Who to reach**")
             if lead.get("Contact"):
-                st.markdown(f"- {lead['Contact']}, {lead['Contact Title']}" + (f"\n- {lead['Contact Email']}" if lead.get("Contact Email") else ""))
+                lines = [f"- {lead['Contact']}, {lead['Contact Title']}"]
+                if lead.get("Contact Email"):
+                    lines.append(f"- {lead['Contact Email']}")
+                if lead.get("Contact LinkedIn"):
+                    lines.append(f"- [LinkedIn profile]({lead['Contact LinkedIn']})")
+                st.markdown("\n".join(lines))
             else:
                 st.markdown("- No contact yet. Add an Apollo key in the sidebar to run People Search, or look up the titles below on LinkedIn.")
             st.markdown(f"- Target titles: {lead['Target Titles']}")
