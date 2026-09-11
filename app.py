@@ -19,8 +19,10 @@ Deploy (free, public URL in ~2 minutes)
 
 Pipeline
 --------
-    URL  ->  scrape (MapYourShow / A2Z Events / generic HTML)
-         ->  fallback sample dataset if the site blocks us or renders via JS
+    URL  ->  scrape: MapYourShow JSON API (full exhibitor list + floor-plan
+             booth geometry, so booth sizes are exact), or generic HTML tables
+             and cards for other directories. No sample data: if a site cannot
+             be read the app says so and stops.
          ->  enrichment (simulated Apollo/Clearbit; real Apollo if a key is set)
          ->  Goldilocks scoring (0-100) on booth size, revenue, headcount
          ->  decision-maker targeting + timeline-aware 4-touch email sequence
@@ -37,9 +39,10 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import random
 import re
-import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Callable
 from urllib.parse import urljoin, urlparse
@@ -99,25 +102,38 @@ REQUEST_HEADERS = {
 # -----------------------------------------------------------------------------
 TARGET_SHOWS = [
     {"name": "IWCE 2027", "start": "2027-03-08", "end": "2027-03-11", "venue": "Las Vegas Convention Center",
-     "industry": "Tech & Comms", "potential": "High", "site": "https://www.iwceexpo.com"},
+     "industry": "Tech & Comms", "potential": "High", "site": "https://www.iwceexpo.com", "directory": ""},
     {"name": "Shoptalk 2027", "start": "2027-03-22", "end": "2027-03-24", "venue": "Mandalay Bay",
-     "industry": "Retail Tech & E-commerce", "potential": "Very High", "site": "https://shoptalk.com"},
+     "industry": "Retail Tech & E-commerce", "potential": "Very High", "site": "https://shoptalk.com", "directory": ""},
     {"name": "Bar & Restaurant Expo 2027", "start": "2027-03-22", "end": "2027-03-24", "venue": "Las Vegas Convention Center",
-     "industry": "Food & Beverage", "potential": "Medium", "site": "https://www.barandrestaurantexpo.com"},
+     "industry": "Food & Beverage", "potential": "Medium", "site": "https://www.barandrestaurantexpo.com", "directory": ""},
     {"name": "Indoor Ag-Con 2027", "start": "2027-03-24", "end": "2027-03-25", "venue": "Las Vegas Convention Center",
-     "industry": "Agriculture Tech", "potential": "Medium", "site": "https://indoor.ag"},
+     "industry": "Agriculture Tech", "potential": "Medium", "site": "https://indoor.ag", "directory": ""},
     {"name": "NAB Show 2027", "start": "2027-04-04", "end": "2027-04-07", "venue": "Las Vegas Convention Center",
-     "industry": "Broadcast, Media & Tech", "potential": "Massive", "site": "https://nabshow.com"},
+     "industry": "Broadcast, Media & Tech", "potential": "Massive", "site": "https://nabshow.com",
+     "directory": "https://nab27.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false"},
     {"name": "Pizza Expo 2027", "start": "2027-04-13", "end": "2027-04-15", "venue": "Las Vegas Convention Center",
-     "industry": "Food & Beverage", "potential": "Medium", "site": "https://www.pizzaexpo.com"},
+     "industry": "Food & Beverage", "potential": "Medium", "site": "https://www.pizzaexpo.com", "directory": ""},
     {"name": "WasteExpo 2027", "start": "2027-05-03", "end": "2027-05-06", "venue": "Las Vegas Convention Center",
-     "industry": "Industrial & Heavy Machinery", "potential": "High", "site": "https://www.wasteexpo.com"},
+     "industry": "Industrial & Heavy Machinery", "potential": "High", "site": "https://www.wasteexpo.com", "directory": ""},
     {"name": "HD Expo 2027", "start": "2027-05-04", "end": "2027-05-05", "venue": "Mandalay Bay",
-     "industry": "Commercial Design", "potential": "Very High", "site": "https://www.hdexpo.com"},
+     "industry": "Commercial Design", "potential": "Very High", "site": "https://www.hdexpo.com", "directory": ""},
     {"name": "HR in Hospitality 2027", "start": "2027-06-09", "end": "2027-06-10", "venue": "Las Vegas",
-     "industry": "HR & Hospitality Tech", "potential": "Medium", "site": "https://www.hrinhospitality.com"},
+     "industry": "HR & Hospitality Tech", "potential": "Medium", "site": "https://www.hrinhospitality.com", "directory": ""},
 ]
 SHOW_BY_NAME = {s["name"]: s for s in TARGET_SHOWS}
+
+# Other Las Vegas directories already published on MapYourShow (exact booth
+# sizes available). Handy for a live demo when a target show's list isn't out.
+KNOWN_DIRECTORIES = [
+    ("NAB Show 2027", "https://nab27.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false"),
+    ("CES 2026", "https://ces26.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false"),
+    ("World of Concrete 2027", "https://ge27woc.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false"),
+    ("TISE 2027", "https://ge27tise.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false"),
+    ("AHR Expo 2027", "https://ahr27.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false"),
+    ("PACK EXPO Las Vegas 2027", "https://packexpo27.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false"),
+    ("International Roofing Expo 2027", "https://ge27ire.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false"),
+]
 
 # RFP timing model (months before the show floor opens).
 WINDOW_OPEN_MONTHS = 9    # earliest sensible first touch
@@ -177,68 +193,8 @@ GENERIC_INDUSTRIES = [
     "Telecommunications", "Media Services", "Consumer Electronics", "Lighting & Displays",
 ]
 
-# Fictional contact names attached to the sample dataset only. Live scrapes
-# never invent people -- they get contacts from Apollo or stay blank.
-SAMPLE_CONTACT_NAMES = [
-    "Dana Whitfield", "Marcus Bell", "Priya Raman", "Tom Okafor", "Elena Marsh", "Victor Huang",
-    "Sofia Delgado", "Owen Kaplan", "Nadia Petrova", "Luis Herrera", "Grace Lindqvist", "Isaac Moreau",
-    "Hannah Osei", "Ravi Menon", "Claire Dubois", "Jamal Carter", "Mei Tanaka", "Ben Sorensen",
-    "Aisha Rahman", "Noah Fitzgerald",
-]
-
 # =============================================================================
-# 1. FALLBACK SCRAPE DATASET
-# =============================================================================
-# Twenty realistic (fictional) exhibitors in the shape a directory scrape
-# produces: company, website, booth number, booth dimensions. Broadcast/media
-# flavoured to match NAB Show, the biggest show in the target window. The
-# booth mix is deliberately varied so the Goldilocks filter has something to
-# reject: a handful of 10x10s, a couple of islands, and a core of 10x20 /
-# 20x20 / 20x30 spaces.
-FALLBACK_EXHIBITORS = [
-    ("Lumen Audio Labs", "https://www.lumenaudiolabs.com", "C5831", "20x20"),
-    ("Vantage Robotics Systems", "https://www.vantagerobotics.io", "C8437", "10x20"),
-    ("Kestrel Aerial Cinema", "https://www.kestrelaerial.com", "N1210", "20x30"),
-    ("Northbridge Signal Systems", "https://www.northbridgesignal.com", "W2118", "10x10"),
-    ("Helios Studio Lighting", "https://www.heliosstudiolighting.com", "C9033", "10x30"),
-    ("Orbit Wireless Video", "https://www.orbitwirelessvideo.com", "C6502", "20x20"),
-    ("Clearwave Networking", "https://www.clearwavenet.com", "W1419", "30x30"),
-    ("Summit Streaming Platforms", "https://www.summitstreaming.com", "W4701", "20x30"),
-    ("Aurora Display Technologies", "https://www.auroradisplays.com", "C7114", "50x50"),
-    ("Pinnacle Newsroom Software", "https://www.pinnaclenewsroom.com", "W3309", "10x20"),
-    ("Redrock Podcast Gear", "https://www.redrockpodcast.com", "N5720", "20x20"),
-    ("Tidewater Satellite Uplink", "https://www.tidewateruplink.com", "N6118", "10x10"),
-    ("Beacon Intercom Systems", "https://www.beaconintercom.com", "C10240", "10x20"),
-    ("Stratos Media AI", "https://www.stratosmedia.ai", "W3316", "40x40"),
-    ("Copperline Audio", "https://www.copperlineaudio.com", "C5605", "10x10"),
-    ("Evergreen Battery Co.", "https://www.evergreenbattery.com", "C9407", "20x20"),
-    ("Nimbus Cloud Cameras", "https://www.nimbuscams.com", "N4022", "10x20"),
-    ("Ironwood Rugged Computing", "https://www.ironwoodrugged.com", "W2811", "20x30"),
-    ("Skyline Virtual Production", "https://www.skylinevp.com", "C8830", "20x20"),
-    ("Meridian Captioning", "https://www.meridiancaptioning.com", "W5107", "10x30"),
-]
-FALLBACK_CONVENTION = "NAB Show 2027"
-
-
-def load_fallback_dataset() -> list[dict]:
-    """Return the bundled sample in exactly the shape `parse_exhibitors` returns."""
-    rows = []
-    for name, site, booth, dims in FALLBACK_EXHIBITORS:
-        rows.append(
-            {
-                "Company": name,
-                "Website": site,
-                "Booth": booth,
-                "Booth Size": dims,
-                "Sq Ft": booth_dims_to_sqft(dims),
-                "Size Source": "sample",
-            }
-        )
-    return rows
-
-
-# =============================================================================
-# 2. BOOTH-SIZE HELPERS
+# 1. BOOTH-SIZE HELPERS
 # =============================================================================
 
 DIMS_RE = re.compile(r"(\d{1,3})\s*(?:'|ft|′)?\s*[xX×]\s*(\d{1,3})\s*(?:'|ft|′)?")
@@ -275,32 +231,13 @@ def extract_booth_size(text: str) -> tuple[str, int] | None:
     return None
 
 
-def estimate_booth_size(company: str, booth_no: str) -> tuple[str, int]:
-    """
-    Deterministic estimate used when the directory does not publish dimensions
-    (most public exhibitor lists show the booth number only).
-
-    PRODUCTION NOTE: both MapYourShow and A2Z expose booth geometry through
-    their floor-plan endpoints (MYS: /floorplan/ JSON, A2Z: eBooth.aspx and the
-    booth-detail API). Pull the polygon width/depth from there and this
-    estimate becomes unnecessary. The distribution below mirrors a typical
-    Vegas show floor: mostly 10x10s, a healthy middle, a few islands.
-    """
-    seed = int(hashlib.md5(f"{company}|{booth_no}".lower().encode()).hexdigest(), 16)
-    rng = random.Random(seed)
-    sizes = ["10x10", "10x20", "20x20", "10x30", "20x30", "30x30", "40x40", "50x50"]
-    weights = [42, 20, 15, 6, 9, 4, 3, 1]
-    dims = rng.choices(sizes, weights=weights, k=1)[0]
-    return dims, booth_dims_to_sqft(dims)
-
-
 # =============================================================================
-# 3. LIVE URL SCRAPER
+# 2. LIVE URL SCRAPER
 # =============================================================================
 
 
 class ScrapeError(Exception):
-    """Raised for any condition that should trigger the fallback dataset."""
+    """Raised when a directory cannot be read; the UI shows the reason and stops."""
 
 
 def detect_platform(url: str) -> str:
@@ -577,25 +514,284 @@ def parse_exhibitors(html: str, base_url: str) -> list[dict]:
             continue
         seen.add(key)
         if not row["Sq Ft"]:
-            dims, sqft = estimate_booth_size(row["Company"], row["Booth"])
-            row["Booth Size"], row["Sq Ft"], row["Size Source"] = dims, sqft, "estimated"
+            # No dimensions published: leave the size unknown rather than invent one.
+            row["Booth Size"], row["Sq Ft"], row["Size Source"] = "", 0, "unknown"
+        row.setdefault("Hall", "")
+        row.setdefault("Description", "")
+        row.setdefault("Detail URL", "")
         rows.append(row)
 
     if len(rows) < MIN_ROWS_FOR_VALID_SCRAPE:
         raise ScrapeError(
             "No exhibitor rows found in the HTML. The directory is most likely "
-            "rendered client-side (JavaScript) or behind a bot challenge."
+            "rendered client-side (JavaScript) or behind a bot challenge. "
+            "MapYourShow directories are fully supported; for other platforms "
+            "paste a page that lists exhibitors in a plain HTML table or card grid."
         )
     return rows
+
+
+# -----------------------------------------------------------------------------
+# MapYourShow (the platform behind CES, NAB Show, World of Concrete, PACK EXPO,
+# AHR, TISE and most other big Las Vegas shows).
+#
+# The public directory is a Vue app, so the HTML carries no exhibitor rows.
+# The data comes from three JSON endpoints that answer to a plain GET with an
+# X-Requested-With header and no cookies:
+#
+#   1. /8_0/ajax/remote-proxy.cfm?action=getsearchoptions&function=getBoothHalls
+#        -> every hall in the show: {fieldvalue: "C", fielddisplay: "Central Hall"}
+#   2. /8_0/ajax/remote-proxy.cfm?action=search&searchtype=exhibitorgallery&searchsize=20000
+#        -> the complete exhibitor list in one call (name, exhibitor id, booth
+#           numbers, hall ids, description)
+#   3. /8_0/floorplan/02/_remote-proxy.cfm?showid=NAB27&hallid=C&action=GetBoothByHall
+#        -> every booth polygon in that hall with boothWidth / boothHeight
+#           (inches) and area (sq ft), plus the exhibitor id that holds it.
+#
+# Joining 2 and 3 on the exhibitor id gives exact booth footprints for the
+# whole show -- the number this entire tool is built around.
+# -----------------------------------------------------------------------------
+
+MYS_JSON_HEADERS = {**REQUEST_HEADERS, "X-Requested-With": "XMLHttpRequest", "Accept": "application/json, text/plain, */*"}
+MYS_MAX_WORKERS = 6
+
+
+def mys_base(url: str) -> tuple[str, str]:
+    """'https://nab27.mapyourshow.com/8_0/explore/...' -> ('https://nab27.mapyourshow.com', '8_0')."""
+    p = urlparse(url)
+    m = re.search(r"/(\d+_\d+)/", p.path)
+    return f"{p.scheme or 'https'}://{p.netloc}", (m.group(1) if m else "8_0")
+
+
+def _mys_json(url: str, params: dict, referer: str) -> dict:
+    try:
+        resp = requests.get(url, params=params, headers={**MYS_JSON_HEADERS, "Referer": referer}, timeout=REQUEST_TIMEOUT * 3)
+    except requests.exceptions.RequestException as exc:
+        raise ScrapeError(f"MapYourShow request failed: {exc.__class__.__name__}")
+    if resp.status_code != 200:
+        raise ScrapeError(f"MapYourShow returned HTTP {resp.status_code} for {params.get('action', 'request')}")
+    try:
+        return resp.json()
+    except ValueError:
+        raise ScrapeError("MapYourShow returned a non-JSON response (has the show code changed?)")
+
+
+def _mys_booths_for_hall(booth_url: str, showid: str, hall: str, referer: str) -> list[dict]:
+    """All booth records in one hall, with dimensions parsed out of FEATUREPROPERTIES."""
+    data = _mys_json(booth_url, {"showid": showid, "selectedbooth": "", "hallid": hall,
+                                 "action": "GetBoothByHall", "method": "GetBoothByHall", "regid": 0}, referer)
+    cols = data.get("COLUMNS") or []
+    out = []
+    for raw in data.get("DATA") or []:
+        rec = dict(zip(cols, raw))
+        if rec.get("OBJECTTYPE") != "booth" or not rec.get("EXHID"):
+            continue
+        props = rec.get("FEATUREPROPERTIES") or {}
+        if isinstance(props, str):
+            try:
+                props = json.loads(props)
+            except ValueError:
+                props = {}
+        props = props.get("properties") or {}
+        try:
+            area = float(props.get("area") or 0)
+        except (TypeError, ValueError):
+            area = 0.0
+        width_in, depth_in = props.get("boothWidth"), props.get("boothHeight")
+        if not area and width_in and depth_in:
+            area = float(width_in) * float(depth_in) / 144.0
+        out.append({
+            "exhid": str(rec["EXHID"]),
+            "name": _clean(str(rec.get("EXHNAME") or "")),
+            "booth": _clean(str(rec.get("BOOTHDISPLAY") or rec.get("BOOTH") or "")),
+            "hall": hall,
+            "status": rec.get("BOOTHSTATUS") or "",
+            "area": round(area),
+            "width_ft": round(float(width_in) / 12, 1) if width_in else None,
+            "depth_ft": round(float(depth_in) / 12, 1) if depth_in else None,
+        })
+    return out
+
+
+def _fmt_ft(v: float | None) -> str:
+    return "" if v is None else (f"{int(v)}" if float(v).is_integer() else f"{v:g}")
+
+
+def scrape_mapyourshow(url: str) -> tuple[list[dict], dict]:
+    """Full MapYourShow pull: halls + exhibitor gallery + booth geometry, joined by exhibitor id."""
+    origin, root = mys_base(url)
+    proxy = f"{origin}/{root}/ajax/remote-proxy.cfm"
+    referer = f"{origin}/{root}/explore/exhibitor-gallery.cfm"
+
+    # 1. Halls ---------------------------------------------------------------
+    halls_json = _mys_json(proxy, {"action": "getsearchoptions", "function": "getBoothHalls"}, referer)
+    halls = {str(h.get("fieldvalue")): str(h.get("fielddisplay") or h.get("fieldvalue"))
+             for h in (halls_json.get("DATA") or []) if h.get("fieldvalue")}
+
+    # 2. Exhibitor gallery (all of it) ---------------------------------------
+    gallery = _mys_json(proxy, {"action": "search", "searchtype": "exhibitorgallery", "searchsize": 20000}, referer)
+    try:
+        hits = gallery["DATA"]["results"]["exhibitor"]["hit"]
+    except (KeyError, TypeError):
+        raise ScrapeError("MapYourShow gallery search returned an unexpected shape.")
+    exhibitors: dict[str, dict] = {}
+    for hit in hits:
+        f = hit.get("fields") or {}
+        exhid = str(f.get("exhid_l") or hit.get("id") or "").strip()
+        name = _clean(str(f.get("exhname_t") or ""))
+        if not exhid or not name:
+            continue
+        exhibitors[exhid] = {
+            "exhid": exhid,
+            "Company": name,
+            "Booth": ", ".join(str(b) for b in (f.get("boothsdisplay_la") or f.get("booths_la") or [])),
+            "Halls": [str(h) for h in (f.get("hallid_la") or [])],
+            "Description": _clean(str(f.get("exhdesc_t") or ""))[:400],
+        }
+    if not exhibitors:
+        raise ScrapeError("MapYourShow returned zero exhibitors -- the directory may not be published yet.")
+
+    # 3. Show id + floor-plan app version (from the floor-plan page) ----------
+    showid = urlparse(origin).netloc.split(".")[0].upper()
+    fpver = "02"
+    try:
+        fp_html = requests.get(f"{origin}/{root}/floorplan/", headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT).text
+        m = re.search(r'ShowID\s*=\s*"([^"]+)"', fp_html)
+        if m:
+            showid = m.group(1)
+        m = re.search(r"floorplan/(\d{2})/", fp_html)
+        if m:
+            fpver = m.group(1)
+    except requests.exceptions.RequestException:
+        pass  # fall back to the subdomain-derived show id
+
+    # 4. Booth geometry, hall by hall (only halls that actually hold exhibitors)
+    wanted = sorted({h for ex in exhibitors.values() for h in ex["Halls"] if h in halls}) or list(halls)
+    booth_url = f"{origin}/{root}/floorplan/{fpver}/_remote-proxy.cfm"
+    booths_by_exh: dict[str, list[dict]] = {}
+    hall_errors = 0
+    if wanted:
+        with ThreadPoolExecutor(max_workers=MYS_MAX_WORKERS) as pool:
+            for result in pool.map(lambda h: _safe_hall(booth_url, showid, h, referer), wanted):
+                if result is None:
+                    hall_errors += 1
+                    continue
+                for b in result:
+                    booths_by_exh.setdefault(b["exhid"], []).append(b)
+
+    # 5. Join ----------------------------------------------------------------
+    rows = []
+    for exhid, ex in exhibitors.items():
+        booths = booths_by_exh.get(exhid, [])
+        if booths:
+            total = int(round(sum(b["area"] for b in booths)))
+            biggest = max(booths, key=lambda b: b["area"])
+            if biggest["width_ft"] and biggest["depth_ft"]:
+                dims = f"{_fmt_ft(biggest['width_ft'])}x{_fmt_ft(biggest['depth_ft'])}"
+            else:
+                dims = f"{biggest['area']} sq ft"
+            if len(booths) > 1:
+                dims += f" (+{len(booths) - 1})"
+            hall_names = sorted({halls.get(b["hall"], b["hall"]) for b in booths})
+            booth_no = ", ".join(sorted({b["booth"] for b in booths if b["booth"]})) or ex["Booth"]
+            source = "floorplan"
+        else:
+            total, dims, source = 0, "", "unknown"
+            hall_names = [halls.get(h, h) for h in ex["Halls"]]
+            booth_no = ex["Booth"]
+        rows.append({
+            "Company": ex["Company"],
+            "Website": "",
+            "Booth": booth_no,
+            "Booth Size": dims,
+            "Sq Ft": total,
+            "Size Source": source,
+            "Hall": "; ".join(hall_names),
+            "Description": ex["Description"],
+            "Detail URL": f"{origin}/{root}/exhibitor/exhibitor-details.cfm?exhid={exhid}",
+        })
+
+    # Floor-plan booths whose exhibitor is not (yet) in the public gallery.
+    for exhid, booths in booths_by_exh.items():
+        if exhid in exhibitors:
+            continue
+        name = next((b["name"] for b in booths if b["name"] and b["name"].lower() != "unassigned"), "")
+        if not name:
+            continue
+        total = int(round(sum(b["area"] for b in booths)))
+        biggest = max(booths, key=lambda b: b["area"])
+        dims = (f"{_fmt_ft(biggest['width_ft'])}x{_fmt_ft(biggest['depth_ft'])}"
+                if biggest["width_ft"] and biggest["depth_ft"] else f"{biggest['area']} sq ft")
+        rows.append({
+            "Company": name, "Website": "",
+            "Booth": ", ".join(sorted({b["booth"] for b in booths if b["booth"]})),
+            "Booth Size": dims, "Sq Ft": total, "Size Source": "floorplan",
+            "Hall": "; ".join(sorted({halls.get(b["hall"], b["hall"]) for b in booths})),
+            "Description": "",
+            "Detail URL": f"{origin}/{root}/exhibitor/exhibitor-details.cfm?exhid={exhid}",
+        })
+
+    rows.sort(key=lambda r: r["Company"].lower())
+    convention = infer_convention_name(url)
+    try:
+        page = requests.get(referer, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+        if page.status_code == 200:
+            convention = infer_convention_name(url, BeautifulSoup(page.text, "html.parser"))
+    except requests.exceptions.RequestException:
+        pass
+    meta = {
+        "convention": convention,
+        "platform": "MapYourShow",
+        "source": "live",
+        "url": url,
+        "halls": len(wanted),
+        "hall_errors": hall_errors,
+        "sized": sum(1 for r in rows if r["Size Source"] == "floorplan"),
+    }
+    return rows, meta
+
+
+def _safe_hall(booth_url: str, showid: str, hall: str, referer: str) -> list[dict] | None:
+    try:
+        return _mys_booths_for_hall(booth_url, showid, hall, referer)
+    except ScrapeError:
+        return None
+
+
+WEBSITE_RE = re.compile(r'websiteValue:\s*"([^"]*)"')
+
+
+def fetch_mys_website(detail_url: str) -> str:
+    """The exhibitor detail page is server-rendered and carries websiteValue: "https://..."."""
+    if not detail_url:
+        return ""
+    try:
+        resp = requests.get(detail_url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return ""
+        m = WEBSITE_RE.search(resp.text)
+        if not m:
+            return ""
+        site = m.group(1).replace("\\/", "/").strip()
+        return site if site.startswith("http") else (f"https://{site}" if site else "")
+    except requests.exceptions.RequestException:
+        return ""
+
+
+def fetch_websites(detail_urls: list[str]) -> list[str]:
+    with ThreadPoolExecutor(max_workers=MYS_MAX_WORKERS) as pool:
+        return list(pool.map(fetch_mys_website, detail_urls))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def scrape_directory(url: str) -> tuple[list[dict], dict]:
     """
-    Fetch + parse a directory URL. Returns (rows, meta). Raises ScrapeError on
-    anything that should trigger the fallback. Cached for an hour so tweaking
-    the sidebar never re-hits the show's servers.
+    Fetch + parse a directory URL. Returns (rows, meta). Raises ScrapeError
+    with a plain-English reason when the site cannot be read. Cached for an
+    hour so tweaking the sidebar never re-hits the show's servers.
     """
+    if detect_platform(url) == "MapYourShow":
+        return scrape_mapyourshow(url)
     html = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
     rows = parse_exhibitors(html, url)
@@ -604,6 +800,9 @@ def scrape_directory(url: str) -> tuple[list[dict], dict]:
         "platform": detect_platform(url),
         "source": "live",
         "url": url,
+        "halls": 0,
+        "hall_errors": 0,
+        "sized": sum(1 for r in rows if r["Size Source"] == "scraped"),
     }
     return rows, meta
 
@@ -613,11 +812,14 @@ def scrape_directory(url: str) -> tuple[list[dict], dict]:
 # =============================================================================
 
 
-def infer_industry(company: str, rng: random.Random) -> str:
-    name = company.lower()
-    for pattern, industry in INDUSTRY_PATTERNS:
-        if re.search(pattern, name):
-            return industry
+def infer_industry(company: str, rng: random.Random, description: str = "") -> str:
+    """Keyword match on the company name first, then its directory description."""
+    for text in (company.lower(), (description or "").lower()):
+        if not text:
+            continue
+        for pattern, industry in INDUSTRY_PATTERNS:
+            if re.search(pattern, text):
+                return industry
     return rng.choice(GENERIC_INDUSTRIES)
 
 
@@ -634,16 +836,19 @@ def recommend_titles(headcount: int) -> list[str]:
     return ["Trade Show Manager", "Director of Field Marketing", "Event Marketing Manager"]
 
 
-def simulate_enrichment(company: str, website: str, sqft: int) -> dict:
+def simulate_enrichment(company: str, sqft: int, description: str = "") -> dict:
     """
-    Stand-in for an Apollo / Clearbit organisation-enrichment call.
+    Stand-in for an Apollo / Clearbit organisation-enrichment call. The company
+    name, booth and description are real; only revenue and headcount are
+    modelled until an Apollo key is present.
 
     Deterministic: the same company always gets the same numbers, so the demo
     is stable across reruns and the sidebar filters behave predictably. Booth
     footprint is used as a prior because it correlates with company scale on
-    a real show floor (a 50x50 island is not a 12-person startup).
+    a real show floor (a 50x50 island is not a 12-person startup). Unknown
+    footprint (0) is treated like a small inline booth.
     """
-    seed = int(hashlib.md5(f"{company}|{website}".lower().encode()).hexdigest(), 16) % (2**32)
+    seed = int(hashlib.md5(company.lower().encode()).hexdigest(), 16) % (2**32)
     rng = random.Random(seed)
 
     if sqft <= 100:
@@ -663,18 +868,9 @@ def simulate_enrichment(company: str, website: str, sqft: int) -> dict:
     return {
         "Revenue ($M)": round(revenue, 1),
         "Headcount": headcount,
-        "Industry": infer_industry(company, rng),
+        "Industry": infer_industry(company, rng, description),
         "Enrichment": "simulated",
     }
-
-
-def simulate_contact(company: str, website: str, headcount: int, index: int) -> dict:
-    """Fictional decision-maker for SAMPLE rows only (the companies are fictional too)."""
-    name = SAMPLE_CONTACT_NAMES[index % len(SAMPLE_CONTACT_NAMES)]
-    title = recommend_titles(headcount)[0]
-    domain = urlparse(website).netloc.replace("www.", "") or "example.com"
-    first, last = name.lower().split(" ", 1)
-    return {"Contact": name, "Contact Title": title, "Contact Email": f"{first}.{last}@{domain}"}
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -779,15 +975,15 @@ def enrich_companies(rows: list[dict], api_key: str | None = None, progress=None
     Append Revenue / Headcount / Industry / decision-maker targeting to every
     scraped row.
 
-    With no API key every row is simulated. With a key, Apollo is tried first
-    and simulation only fills gaps (missing domain, no match, API error).
-    Contacts: sample rows get fictional contacts; live rows get Apollo people
-    (if a key is present) or stay blank -- the app never invents a real person.
+    With no API key, revenue and headcount are simulated. With a key, Apollo is
+    tried first and simulation only fills gaps (missing domain, no match, API
+    error). Contacts come from Apollo People Search when a key and a domain
+    are available; otherwise they stay blank -- the app never invents a person.
     """
     enriched = []
     for i, row in enumerate(rows):
         domain = urlparse(row.get("Website") or "").netloc.replace("www.", "")
-        sim = simulate_enrichment(row["Company"], row.get("Website", ""), int(row.get("Sq Ft") or 0))
+        sim = simulate_enrichment(row["Company"], int(row.get("Sq Ft") or 0), row.get("Description", ""))
         result = enrich_company_apollo(domain, api_key) if (api_key and domain) else None
         if result:
             for k, v in sim.items():  # fill any blanks Apollo left
@@ -798,15 +994,12 @@ def enrich_companies(rows: list[dict], api_key: str | None = None, progress=None
 
         titles = recommend_titles(int(result["Headcount"]))
         contact = {"Contact": "", "Contact Title": "", "Contact Email": ""}
-        if row.get("Size Source") == "sample":
-            contact = simulate_contact(row["Company"], row.get("Website", ""), int(result["Headcount"]), i)
-        elif api_key and domain:
+        if api_key and domain:
             contact = find_contact_apollo(domain, tuple(titles), api_key) or contact
 
         enriched.append({**row, **result, **contact, "Target Titles": " > ".join(titles)})
-        if progress is not None:
+        if progress is not None and (i % 50 == 0 or i + 1 == len(rows)):
             progress(i + 1, len(rows), row["Company"])
-        time.sleep(0.02)  # purely cosmetic -- makes the status log feel like real API calls
     return pd.DataFrame(enriched)
 
 
@@ -851,6 +1044,8 @@ def score_leads(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     def tier(row):
         if row["Goldilocks"]:
             return "Goldilocks"
+        if not row["Sq Ft"]:
+            return "No booth data"
         if row["Score"] >= NEAR_MISS_THRESHOLD:
             return "Near miss"
         return "Out of range"
@@ -1048,7 +1243,9 @@ def build_campaign_export(leads: pd.DataFrame, show: str, show_start: date | Non
             "Booth": lead["Booth"],
             "Booth Size": lead["Booth Size"],
             "Sq Ft": lead["Sq Ft"],
+            "Hall": lead.get("Hall", ""),
             "Industry": lead["Industry"],
+            "Description": lead.get("Description", ""),
             "Revenue ($M)": lead["Revenue ($M)"],
             "Headcount": lead["Headcount"],
             "Score": lead["Score"],
@@ -1135,7 +1332,6 @@ def inject_css() -> None:
             margin-right: .4rem;
         }
         .ax-live     { background: rgba(34,197,94,.18);  color: #16a34a; border: 1px solid rgba(34,197,94,.45); }
-        .ax-fallback { background: rgba(245,158,11,.18); color: #d97706; border: 1px solid rgba(245,158,11,.45); }
         .ax-neutral  { background: rgba(59,130,246,.15); color: #3b82f6; border: 1px solid rgba(59,130,246,.4); }
         .ax-muted { opacity: .7; font-size: .85rem; }
         .ax-legend { display:inline-block; width: 12px; height: 12px; border-radius: 3px;
@@ -1205,6 +1401,12 @@ def render_sidebar() -> dict:
             "Exhibit value per sq ft ($)", min_value=25, max_value=1000, step=25, key="price_per_sqft",
             help="Pipeline estimate = booth sq ft x $/sq ft for every qualified lead.",
         )
+        website_cap = st.number_input(
+            "Websites to look up for top leads", min_value=0, max_value=300, value=25, step=25,
+            help="MapYourShow publishes each exhibitor's website on its detail page. The app fetches them for the "
+                 "highest-scoring leads after a scrape (one request per company); use the button under the grid "
+                 "to fetch more.",
+        )
 
         st.divider()
         st.markdown("**Sender details** (for the email sequence)")
@@ -1234,6 +1436,7 @@ def render_sidebar() -> dict:
         "headcount_range": st.session_state["headcount_range"],
         "only_goldilocks": st.session_state["only_goldilocks"],
         "price_per_sqft": st.session_state["price_per_sqft"],
+        "website_cap": int(website_cap),
         "sender": sender,
         "apollo_key": apollo_key.strip() or None,
     }
@@ -1283,41 +1486,35 @@ def build_meta(url: str, convention: str, platform: str, source: str, reason: st
     }
 
 
-def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, force_sample: bool = False) -> None:
-    """Scrape (or fall back), enrich, and stash the result in session state."""
+def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, params: dict) -> None:
+    """Scrape, enrich, score, fetch websites for the top leads, stash in session state."""
     with st.status("Working...", expanded=True) as status:
-        rows, meta, warning = None, None, None
+        st.write(f"Fetching directory: `{url}`")
+        try:
+            rows, live_meta = scrape_directory(url)
+        except ScrapeError as exc:
+            status.update(label="Scrape failed", state="error", expanded=True)
+            st.error(
+                f"Could not read that directory: {exc}\n\n"
+                "Fully supported: MapYourShow directories (CES, NAB Show, World of Concrete, PACK EXPO, AHR, TISE "
+                "and most large Las Vegas shows). For other platforms, paste a page that lists exhibitors in a "
+                "plain HTML table or card grid."
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - surface the real reason, never fake data
+            status.update(label="Scrape failed", state="error", expanded=True)
+            st.error(f"Unexpected error while scraping: {exc.__class__.__name__}: {exc}")
+            return
 
-        if force_sample:
-            rows = load_fallback_dataset()
-            convention = infer_convention_name(url) if url else FALLBACK_CONVENTION
-            if chosen_show == "Auto-detect from URL" and not url:
-                convention = FALLBACK_CONVENTION
-            meta = build_meta(url, convention, detect_platform(url) if url else "Sample", "fallback",
-                              "Sample dataset loaded on request.", chosen_show)
-            st.write("Loaded the bundled sample dataset (20 exhibitors).")
+        meta = build_meta(url, live_meta["convention"], live_meta["platform"], "live", "", chosen_show)
+        meta.update({k: live_meta.get(k, 0) for k in ("halls", "hall_errors", "sized")})
+        if meta["platform"] == "MapYourShow":
+            st.write(f"Exhibitor gallery: **{len(rows)}** companies. Floor plan: **{meta['sized']}** with exact booth "
+                     f"footprints across {meta['halls']} halls"
+                     + (f" ({meta['hall_errors']} halls could not be read)" if meta["hall_errors"] else "") + ".")
         else:
-            st.write(f"Fetching directory: `{url}`")
-            try:
-                rows, live_meta = scrape_directory(url)
-                meta = build_meta(url, live_meta["convention"], live_meta["platform"], "live", "", chosen_show)
-                st.write(f"Parsed **{len(rows)}** exhibitors from {meta['platform']}.")
-            except ScrapeError as exc:
-                warning = str(exc)
-            except Exception as exc:  # belt and braces -- the demo must not break
-                warning = f"Unexpected error: {exc.__class__.__name__}"
-
-            if warning:
-                # ---- Graceful fallback ---------------------------------------
-                # Convention sites routinely sit behind Cloudflare or render the
-                # exhibitor list with JavaScript, so a plain HTTP scrape often
-                # comes back empty. Rather than surfacing a stack trace, load a
-                # dataset with the exact same columns so every downstream
-                # module still works.
-                st.write(f"Live scrape failed: {warning}")
-                st.write("Loading the fallback scrape dataset so the pipeline continues.")
-                rows = load_fallback_dataset()
-                meta = build_meta(url, infer_convention_name(url), detect_platform(url), "fallback", warning, chosen_show)
+            st.write(f"Parsed **{len(rows)}** exhibitors from {meta['platform']} "
+                     f"({meta['sized']} with booth dimensions on the page).")
 
         # ---- Enrichment ----------------------------------------------------
         st.write("Enriching via Apollo API..." if apollo_key else "Enriching (simulated Apollo/Clearbit lookup)...")
@@ -1329,15 +1526,40 @@ def run_pipeline(url: str, apollo_key: str | None, chosen_show: str, force_sampl
         leads = enrich_companies(rows, api_key=apollo_key, progress=on_progress)
         bar.progress(1.0, text=f"Enriched {len(leads)} companies")
 
+        # ---- Websites for the top leads (MapYourShow detail pages) --------
+        cap = int(params.get("website_cap") or 0)
+        if cap and "Detail URL" in leads.columns and leads["Detail URL"].astype(bool).any():
+            scored = score_leads(leads, params)
+            top = scored[(scored["Website"] == "") & (scored["Detail URL"] != "")].head(cap)
+            if len(top):
+                st.write(f"Looking up websites for the top {len(top)} leads...")
+                sites = fetch_websites(list(top["Detail URL"]))
+                site_map = dict(zip(top["Company"], sites))
+                leads["Website"] = [site_map.get(c, w) or w for c, w in zip(leads["Company"], leads["Website"])]
+                st.write(f"Found {sum(1 for s in sites if s)} websites.")
+
         meta["scraped_at"] = datetime.now().strftime("%b %d, %Y %I:%M %p")
         st.session_state["leads"] = leads
         st.session_state["meta"] = meta
+        status.update(label=f"Done: {len(leads)} exhibitors from {meta['convention']} ({meta['platform']})",
+                      state="complete", expanded=False)
 
-        status.update(
-            label=(f"Done: {len(leads)} exhibitors from {meta['convention']} "
-                   f"({'live scrape' if meta['source'] == 'live' else 'fallback dataset'})"),
-            state="complete", expanded=False,
-        )
+
+def fetch_more_websites(cap: int, params: dict) -> None:
+    """Button handler: fill in websites for the next batch of top leads that lack one."""
+    leads = st.session_state.get("leads")
+    if leads is None or "Detail URL" not in leads.columns:
+        return
+    scored = score_leads(leads, params)
+    top = scored[(scored["Website"] == "") & (scored["Detail URL"] != "")].head(cap)
+    if not len(top):
+        st.toast("Every ranked lead already has a website.")
+        return
+    with st.spinner(f"Looking up websites for {len(top)} leads..."):
+        sites = fetch_websites(list(top["Detail URL"]))
+    site_map = dict(zip(top["Company"], sites))
+    leads["Website"] = [site_map.get(c, w) or w for c, w in zip(leads["Company"], leads["Website"])]
+    st.session_state["leads"] = leads
 
 
 # =============================================================================
@@ -1350,16 +1572,18 @@ def render_empty_state() -> None:
         st.markdown("**How to use this**")
         st.markdown(
             """
-            1. Pick a target show below (or leave auto-detect) and paste its exhibitor-list URL. Typical formats:
-               `https://<show>.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm`
-               or `https://<show>.a2zinc.net/<Event>/Public/Exhibitors.aspx`
-            2. Click **Scrape & Analyze**. If the site blocks the request or renders with JavaScript,
-               the app loads a sample dataset automatically so the workflow still runs end-to-end.
-            3. Tune the Goldilocks filter in the sidebar, click a row, and the 4-touch sequence is ready to send.
+            1. Pick a target show (NAB Show 2027 fills its directory in automatically) or paste any exhibitor-list
+               URL. MapYourShow directories (`https://<show>.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm`)
+               return the full exhibitor list plus exact booth footprints from the floor plan.
+            2. Click **Scrape & Analyze**. Every row is a real exhibitor; revenue and headcount are modelled until
+               an Apollo key is added in the sidebar.
+            3. Tune the Goldilocks filter, click a row, and the 4-touch sequence is ready to send.
             """
         )
     st.markdown("#### Target shows: Las Vegas, March - June 2027")
     render_show_calendar()
+    with st.expander("Other Las Vegas directories already live on MapYourShow"):
+        st.markdown("\n".join(f"- {name}: `{link}`" for name, link in KNOWN_DIRECTORIES))
 
 
 def main() -> None:
@@ -1374,26 +1598,27 @@ def main() -> None:
         c_url, c_show = st.columns([4, 2])
         url = c_url.text_input(
             "Enter Trade Show Directory URL (e.g., MapYourShow / A2Z Events)",
-            placeholder="https://nab2027.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm",
+            placeholder="https://nab27.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm?featured=false",
+            help="Leave blank after picking a target show that has a published directory (NAB Show 2027) "
+                 "and the app uses that directory.",
         )
         chosen_show = c_show.selectbox(
             "Target show", ["Auto-detect from URL"] + [s["name"] for s in TARGET_SHOWS], index=0,
             help="Sets the show name, date and venue used in the emails and the outreach timeline.",
         )
-        b1, b2, _ = st.columns([1.4, 1.4, 4])
+        b1, _ = st.columns([1.6, 5])
         scrape_clicked = b1.form_submit_button("Scrape & Analyze", type="primary", **_wide(st.form_submit_button))
-        sample_clicked = b2.form_submit_button("Load sample data", **_wide(st.form_submit_button))
 
     url = (url or "").strip()
+    if not url and chosen_show in SHOW_BY_NAME and SHOW_BY_NAME[chosen_show].get("directory"):
+        url = SHOW_BY_NAME[chosen_show]["directory"]
     if scrape_clicked:
         if not url:
-            st.warning("Paste a directory URL first, or use **Load sample data** to see the workflow.")
+            st.warning("Paste an exhibitor directory URL, or pick NAB Show 2027 (its 2027 directory is already live).")
         else:
             if not url.startswith("http"):
                 url = "https://" + url
-            run_pipeline(url, params["apollo_key"], chosen_show)
-    elif sample_clicked:
-        run_pipeline(url, params["apollo_key"], chosen_show, force_sample=True)
+            run_pipeline(url, params["apollo_key"], chosen_show, params)
 
     leads: pd.DataFrame | None = st.session_state.get("leads")
     meta: dict | None = st.session_state.get("meta")
@@ -1407,13 +1632,14 @@ def main() -> None:
     # ---- Result header: source badge, convention name + date, export --------
     h1, h2, h3, h4 = st.columns([2.8, 1.8, 1.3, 1.1])
     with h1:
-        badge = ("<span class='ax-badge ax-live'>Live scrape</span>" if meta["source"] == "live"
-                 else "<span class='ax-badge ax-fallback'>Fallback dataset</span>")
-        badge += f"<span class='ax-badge ax-neutral'>{meta['platform']}</span>"
+        badge = ("<span class='ax-badge ax-live'>Live scrape</span>"
+                 f"<span class='ax-badge ax-neutral'>{meta['platform']}</span>")
         st.markdown(badge, unsafe_allow_html=True)
-        note = f"{len(leads)} exhibitors &middot; {meta['scraped_at']}"
-        if meta["source"] != "live" and meta.get("reason"):
-            note += f" &middot; {meta['reason']}"
+        sized = int(meta.get("sized") or 0)
+        note = f"{len(leads)} exhibitors &middot; {sized} with exact booth footprints"
+        if meta["platform"] == "MapYourShow":
+            note += f" from {meta.get('halls', 0)} halls"
+        note += f" &middot; {meta['scraped_at']}"
         st.markdown(f"<div class='ax-muted'>{note}</div>", unsafe_allow_html=True)
     state_key = slug(f"{meta['url']}_{meta['convention']}")
     with h2:
@@ -1461,7 +1687,8 @@ def main() -> None:
     st.markdown("#### Lead grid")
     f1, f2 = st.columns([3, 1.5])
     search = f1.text_input("Search company, industry or contact", value="", placeholder="e.g. audio, streaming, Lumen")
-    tiers = f2.multiselect("Tier", ["Goldilocks", "Near miss", "Out of range"], default=["Goldilocks", "Near miss", "Out of range"])
+    tier_options = ["Goldilocks", "Near miss", "Out of range", "No booth data"]
+    tiers = f2.multiselect("Tier", tier_options, default=tier_options[:3])
 
     view = scored.copy()
     if params["only_goldilocks"]:
@@ -1472,39 +1699,46 @@ def main() -> None:
         mask = (
             view["Company"].str.contains(search, case=False, na=False)
             | view["Industry"].str.contains(search, case=False, na=False)
+            | view["Hall"].astype(str).str.contains(search, case=False, na=False)
             | view["Contact"].astype(str).str.contains(search, case=False, na=False)
         )
         view = view[mask]
     view = view.reset_index(drop=True)
 
     near = int((scored["Tier"] == "Near miss").sum())
+    nodata = int((scored["Tier"] == "No booth data").sum())
     st.markdown(
         f"<span class='ax-legend'></span> <span class='ax-muted'>Green rows meet all three Goldilocks criteria "
-        f"({near} near-miss leads also worth a call). Click a row to open the outreach sequence.</span>",
+        f"({near} near-miss leads also worth a call; {nodata} exhibitors have no booth on the floor plan yet). "
+        f"Click a row to open the outreach sequence.</span>",
         unsafe_allow_html=True,
     )
 
-    display_cols = ["Company", "Booth", "Booth Size", "Sq Ft", "Revenue ($M)", "Headcount", "Industry",
-                    "Score", "Tier", "Contact", "Contact Title", "Est. Deal ($)", "Website"]
-    grid_df = view[display_cols]
+    has_contacts = bool(view["Contact"].astype(str).str.len().gt(0).any())
+    display_cols = ["Company", "Booth", "Booth Size", "Sq Ft", "Hall", "Revenue ($M)", "Headcount", "Industry",
+                    "Score", "Tier"] + (["Contact", "Contact Title"] if has_contacts else []) + ["Est. Deal ($)", "Website"]
+    grid_df = view[display_cols].copy()
+    grid_df["Sq Ft"] = grid_df["Sq Ft"].where(grid_df["Sq Ft"] > 0)  # blank, not zero, when unknown
+    grid_df["Est. Deal ($)"] = grid_df["Est. Deal ($)"].where(grid_df["Est. Deal ($)"] > 0)
 
     def highlight(row: pd.Series) -> list[str]:
         is_match = bool(view.loc[row.name, "Goldilocks"])
         return ["background-color: rgba(34,197,94,0.20)" if is_match else ""] * len(row)
 
-    styler = grid_df.style.apply(highlight, axis=1).format({"Revenue ($M)": "{:,.1f}", "Est. Deal ($)": "${:,.0f}"})
+    styler = grid_df.style.apply(highlight, axis=1).format({"Revenue ($M)": "{:,.1f}", "Est. Deal ($)": "${:,.0f}"}, na_rep="")
 
     column_config = {
         "Company": st.column_config.TextColumn("Company", width="medium"),
         "Booth": st.column_config.TextColumn("Booth #", width="small"),
-        "Booth Size": st.column_config.TextColumn("Size", width="small"),
-        "Sq Ft": st.column_config.NumberColumn("Sq Ft", width="small", format="%d"),
+        "Booth Size": st.column_config.TextColumn("Size (ft)", width="small", help="Largest booth; (+n) = additional booths."),
+        "Sq Ft": st.column_config.NumberColumn("Sq Ft", width="small", format="%d", help="Total footprint from the floor plan."),
+        "Hall": st.column_config.TextColumn("Hall", width="medium"),
         "Revenue ($M)": st.column_config.NumberColumn("Revenue ($M)", width="small"),
         "Headcount": st.column_config.NumberColumn("Headcount", width="small", format="%d"),
         "Industry": st.column_config.TextColumn("Industry", width="medium"),
         "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d", width="small"),
         "Tier": st.column_config.TextColumn("Tier", width="small"),
-        "Contact": st.column_config.TextColumn("Contact", width="small", help="Sample rows carry fictional contacts; live rows fill from Apollo."),
+        "Contact": st.column_config.TextColumn("Contact", width="small", help="Filled by Apollo People Search when a key is set."),
         "Contact Title": st.column_config.TextColumn("Title", width="medium"),
         "Est. Deal ($)": st.column_config.NumberColumn("Est. deal", width="small"),
         "Website": st.column_config.LinkColumn("Website", display_text=r"https?://(?:www\.)?([^/]+)", width="medium"),
@@ -1521,6 +1755,14 @@ def main() -> None:
             selected_rows = []
     else:  # very old Streamlit: no row selection, fall back to the selectbox only
         st.dataframe(styler, **grid_kwargs)
+
+    missing_sites = int(((scored["Website"] == "") & (scored["Detail URL"] != "") & scored["Goldilocks"]).sum()) if "Detail URL" in scored.columns else 0
+    if missing_sites:
+        w1, w2 = st.columns([1.8, 5])
+        if w1.button(f"Look up websites for next {min(params['website_cap'] or 25, missing_sites)} leads", **_wide(st.button)):
+            fetch_more_websites(params["website_cap"] or 25, params)
+            st.rerun()
+        w2.caption(f"{missing_sites} qualified leads still need a website (one detail-page request each).")
 
     if view.empty:
         st.info("No leads match the current filters. Widen the Goldilocks ranges in the sidebar.")
@@ -1554,14 +1796,21 @@ def main() -> None:
             b_lo, b_hi = params["booth_range"]
             r_lo, r_hi = params["revenue_range"]
             h_lo, h_hi = params["headcount_range"]
+            booth_line = (f"{range_note(lead['Sq Ft'], b_lo, b_hi, ' sq ft')} ({lead['Booth Size']})"
+                          if lead["Sq Ft"] else "not on the floor plan yet (no booth data)")
+            hall_line = f"\n- Hall: {lead['Hall']}" if str(lead.get("Hall") or "") else ""
             st.markdown(md(
-                f"- Booth: {range_note(lead['Sq Ft'], b_lo, b_hi, ' sq ft')} ({lead['Booth Size']})\n"
+                f"- Booth: {booth_line}{hall_line}\n"
                 f"- Revenue: {range_note(lead['Revenue ($M)'], r_lo, r_hi, 'M', '${:,.1f}')}\n"
                 f"- Headcount: {range_note(lead['Headcount'], h_lo, h_hi, ' employees')}\n"
                 f"- Industry: {lead['Industry']}\n"
                 f"- Est. deal: {fmt_money(lead['Est. Deal ($)'])} ({int(lead['Sq Ft'])} sq ft x ${params['price_per_sqft']}/sq ft)\n"
-                f"- Data: booth size {lead['Size Source']}, enrichment {lead['Enrichment']}"
+                f"- Data: booth size from {lead['Size Source']}, revenue/headcount {lead['Enrichment']}"
             ))
+            if str(lead.get("Description") or ""):
+                st.caption(str(lead["Description"])[:260] + ("..." if len(str(lead["Description"])) > 260 else ""))
+            if str(lead.get("Detail URL") or ""):
+                st.markdown(f"[Directory listing]({lead['Detail URL']})")
             st.markdown("**Who to reach**")
             if lead.get("Contact"):
                 st.markdown(f"- {lead['Contact']}, {lead['Contact Title']}" + (f"\n- {lead['Contact Email']}" if lead.get("Contact Email") else ""))
